@@ -44,6 +44,9 @@ def test_model_constructs_and_runs_against_documented_vllm_contract(monkeypatch)
     class FakeIsAttentionFree:
         is_attention_free = True
 
+    class FakeSupportsMambaPrefixCaching:
+        supports_mamba_prefix_caching = True
+
     class FakeEmbedding(nn.Embedding):
         def __init__(self, num_embeddings, embedding_dim, **_):
             super().__init__(num_embeddings, embedding_dim)
@@ -59,11 +62,18 @@ def test_model_constructs_and_runs_against_documented_vllm_contract(monkeypatch)
             return functional.linear(hidden_states, lm_head.weight)
 
     class FakeWeightsLoader:
+        last_mapper = None
+
         def __init__(self, model):
             self.model = model
 
-        def load_weights(self, weights):
+        def load_weights(self, weights, mapper=None):
+            type(self).last_mapper = mapper
             return {name for name, _ in weights}
+
+    class FakeWeightsMapper:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
 
     class FakeMambaAttentionBackendEnum:
         LINEAR = "linear"
@@ -106,11 +116,13 @@ def test_model_constructs_and_runs_against_documented_vllm_contract(monkeypatch)
         "vllm.model_executor.models.interfaces",
         HasInnerState=FakeHasInnerState,
         IsAttentionFree=FakeIsAttentionFree,
+        SupportsMambaPrefixCaching=FakeSupportsMambaPrefixCaching,
     )
     _module(
         monkeypatch,
         "vllm.model_executor.models.utils",
         AutoWeightsLoader=FakeWeightsLoader,
+        WeightsMapper=FakeWeightsMapper,
     )
     _module(monkeypatch, "vllm.v1")
     _module(monkeypatch, "vllm.v1.attention")
@@ -157,6 +169,22 @@ def test_model_constructs_and_runs_against_documented_vllm_contract(monkeypatch)
 
     assert hidden_states.shape == (3, 16)
     assert logits.shape == (3, 32)
+    assert model.config is hf_config
+    assert model.model_config is vllm_config.model_config
+    assert model.supports_mamba_prefix_caching is True
+    assert model.hf_to_vllm_mapper.kwargs == {}
+    public_keys = {
+        "lm_head.weight",
+        "model.embeddings.weight",
+        "model.layers.0.attn.x_r",
+        "model.layers.0.attn.w_lora.lora.0.weight",
+        "model.layers.0.attn.w_lora.lora.2.bias",
+        "model.layers.0.attn.g_norm.bias",
+        "model.layers.0.ffn.key.weight",
+        "model.layers.0.pre_norm.bias",
+        "model.norm.bias",
+    }
+    assert public_keys <= set(model.state_dict())
     assert tuple(vllm_config.compilation_config.static_forward_context) == (
         "model.layers.0",
         "model.layers.1",
@@ -165,6 +193,9 @@ def test_model_constructs_and_runs_against_documented_vllm_contract(monkeypatch)
         (2, 16),
         (2, 4, 4),
     )
+    loaded = model.load_weights([("model.embeddings.weight", torch.empty(0))])
+    assert loaded == {"model.embeddings.weight"}
+    assert FakeWeightsLoader.last_mapper is model.hf_to_vllm_mapper
 
     metadata = SimpleNamespace(
         num_decode_tokens=0,
@@ -215,6 +246,79 @@ def test_model_constructs_and_runs_against_documented_vllm_contract(monkeypatch)
     actual = model(new_prompt, positions=torch.arange(3))
 
     torch.testing.assert_close(actual, expected)
+
+    chunked_tokens = torch.tensor([10, 11, 12, 13])
+    forward_context.attn_metadata = None
+    expected_chunked = model(chunked_tokens, positions=torch.arange(4))
+    for layer in model.model.layers:
+        layer.kv_cache[0].zero_()
+        layer.kv_cache[1].zero_()
+
+    first_chunk_metadata = SimpleNamespace(
+        num_decode_tokens=0,
+        num_decodes=0,
+        query_start_loc=torch.tensor([0, 2], dtype=torch.int32),
+        seq_lens=torch.tensor([2], dtype=torch.int32),
+        state_indices_tensor=torch.tensor([1], dtype=torch.int32),
+    )
+    forward_context.attn_metadata = {
+        layer_name: first_chunk_metadata
+        for layer_name in vllm_config.compilation_config.static_forward_context
+    }
+    first_chunk = model(chunked_tokens[:2], positions=torch.arange(2))
+    second_chunk_metadata = SimpleNamespace(
+        num_decode_tokens=0,
+        num_decodes=0,
+        query_start_loc=torch.tensor([0, 2], dtype=torch.int32),
+        seq_lens=torch.tensor([4], dtype=torch.int32),
+        state_indices_tensor=torch.tensor([1], dtype=torch.int32),
+    )
+    forward_context.attn_metadata = {
+        layer_name: second_chunk_metadata
+        for layer_name in vllm_config.compilation_config.static_forward_context
+    }
+    second_chunk = model(chunked_tokens[2:], positions=torch.arange(2, 4))
+    torch.testing.assert_close(torch.cat((first_chunk, second_chunk)), expected_chunked)
+
+    request_a = torch.tensor([14, 15, 16])
+    request_b = torch.tensor([17, 18, 19])
+    forward_context.attn_metadata = None
+    expected_a = model(request_a, positions=torch.arange(3))
+    expected_b = model(request_b, positions=torch.arange(3))
+    for layer in model.model.layers:
+        layer.kv_cache[0].zero_()
+        layer.kv_cache[1].zero_()
+
+    first_reordered_metadata = SimpleNamespace(
+        num_decode_tokens=0,
+        num_decodes=0,
+        query_start_loc=torch.tensor([0, 2, 3], dtype=torch.int32),
+        seq_lens=torch.tensor([2, 1], dtype=torch.int32),
+        state_indices_tensor=torch.tensor([2, 0], dtype=torch.int32),
+    )
+    forward_context.attn_metadata = {
+        layer_name: first_reordered_metadata
+        for layer_name in vllm_config.compilation_config.static_forward_context
+    }
+    model(torch.cat((request_a[:2], request_b[:1])), positions=torch.arange(3))
+
+    second_reordered_metadata = SimpleNamespace(
+        num_decode_tokens=0,
+        num_decodes=0,
+        query_start_loc=torch.tensor([0, 2, 3], dtype=torch.int32),
+        seq_lens=torch.tensor([3, 3], dtype=torch.int32),
+        state_indices_tensor=torch.tensor([0, 2], dtype=torch.int32),
+    )
+    forward_context.attn_metadata = {
+        layer_name: second_reordered_metadata
+        for layer_name in vllm_config.compilation_config.static_forward_context
+    }
+    reordered = model(
+        torch.cat((request_b[1:], request_a[2:])),
+        positions=torch.arange(3),
+    )
+    torch.testing.assert_close(reordered[:2], expected_b[1:])
+    torch.testing.assert_close(reordered[2:], expected_a[2:])
 
     vllm_config.model_config.enforce_eager = False
     with pytest.raises(NotImplementedError, match="enforce_eager=True"):

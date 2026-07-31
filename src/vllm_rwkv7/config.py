@@ -23,13 +23,26 @@ def _read(source: ConfigSource, name: str, default: Any = _MISSING) -> Any:
 
 
 def _positive_int(name: str, value: Any) -> int:
-    try:
-        resolved = int(value)
-    except (TypeError, ValueError) as error:
-        raise ValueError(f"{name} must be a positive integer, got {value!r}") from error
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be a positive integer, got {value!r}")
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped or not stripped.removeprefix("+").isdigit():
+            raise ValueError(f"{name} must be a positive integer, got {value!r}")
+        resolved = int(stripped)
+    elif isinstance(value, int):
+        resolved = value
+    else:
+        raise ValueError(f"{name} must be a positive integer, got {value!r}")
     if resolved <= 0:
         raise ValueError(f"{name} must be a positive integer, got {resolved}")
     return resolved
+
+
+def _boolean(name: str, value: Any) -> bool:
+    if not isinstance(value, bool):
+        raise ValueError(f"{name} must be a boolean, got {value!r}")
+    return value
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,6 +62,9 @@ class RWKV7ModelConfig:
     attention_hidden_size: int
     intermediate_size: int
     layer_norm_epsilon: float
+    hidden_act: str
+    norm_bias: bool
+    norm_first: bool
     decay_low_rank_dim: int
     gate_low_rank_dim: int
     a_low_rank_dim: int
@@ -66,10 +82,14 @@ class RWKV7ModelConfig:
 
         canonical_heads = _read(source, "num_attention_heads", None)
         legacy_heads = _read(source, "num_heads", None)
+        if canonical_heads is not None:
+            canonical_heads = _positive_int("num_attention_heads", canonical_heads)
+        if legacy_heads is not None:
+            legacy_heads = _positive_int("num_heads", legacy_heads)
         if (
             canonical_heads is not None
             and legacy_heads is not None
-            and int(canonical_heads) != int(legacy_heads)
+            and canonical_heads != legacy_heads
         ):
             raise ValueError(
                 "num_attention_heads and legacy num_heads must match when both are set"
@@ -85,11 +105,11 @@ class RWKV7ModelConfig:
             heads_value = hidden_size // head_dim
         num_attention_heads = _positive_int("num_attention_heads", heads_value)
 
-        attention_hidden_size = _positive_int(
-            "attention_hidden_size",
-            _read(source, "attention_hidden_size", hidden_size),
-        )
         expected_attention_size = num_attention_heads * head_dim
+        attention_hidden_size = _read(source, "attention_hidden_size", None)
+        if attention_hidden_size is None:
+            attention_hidden_size = expected_attention_size
+        attention_hidden_size = _positive_int("attention_hidden_size", attention_hidden_size)
         if attention_hidden_size != expected_attention_size:
             raise ValueError(
                 "attention_hidden_size must equal num_attention_heads * head_dim; "
@@ -98,10 +118,20 @@ class RWKV7ModelConfig:
 
         layer_norm_epsilon = _read(source, "layer_norm_epsilon", None)
         if layer_norm_epsilon is None:
-            layer_norm_epsilon = _read(source, "layer_norm_eps", 1e-5)
+            layer_norm_epsilon = _read(source, "layer_norm_eps", None)
+        if layer_norm_epsilon is None:
+            layer_norm_epsilon = _read(source, "norm_eps", 1e-5)
         layer_norm_epsilon = float(layer_norm_epsilon)
         if layer_norm_epsilon <= 0:
             raise ValueError("layer_norm_epsilon must be positive")
+
+        hidden_act = str(_read(source, "hidden_act", "sqrelu")).lower()
+        if hidden_act != "sqrelu":
+            raise ValueError(f"hidden_act must be 'sqrelu', got {hidden_act!r}")
+        norm_bias = _boolean("norm_bias", _read(source, "norm_bias", True))
+        norm_first = _boolean("norm_first", _read(source, "norm_first", True))
+        if not norm_first:
+            raise ValueError("norm_first=False is not supported by the RWKV-7 adapter")
 
         return cls(
             model_type=str(_read(source, "model_type", "rwkv7_native")),
@@ -117,6 +147,9 @@ class RWKV7ModelConfig:
                 "intermediate_size", _read(source, "intermediate_size", hidden_size * 4)
             ),
             layer_norm_epsilon=layer_norm_epsilon,
+            hidden_act=hidden_act,
+            norm_bias=norm_bias,
+            norm_first=norm_first,
             decay_low_rank_dim=_positive_int(
                 "decay_low_rank_dim", _read(source, "decay_low_rank_dim", 64)
             ),
@@ -125,5 +158,7 @@ class RWKV7ModelConfig:
             ),
             a_low_rank_dim=_positive_int("a_low_rank_dim", _read(source, "a_low_rank_dim", 64)),
             v_low_rank_dim=_positive_int("v_low_rank_dim", _read(source, "v_low_rank_dim", 32)),
-            tie_word_embeddings=bool(_read(source, "tie_word_embeddings", False)),
+            tie_word_embeddings=_boolean(
+                "tie_word_embeddings", _read(source, "tie_word_embeddings", False)
+            ),
         )

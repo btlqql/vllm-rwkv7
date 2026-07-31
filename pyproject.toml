@@ -39,6 +39,7 @@ where = ["src"]
 pythonpath = ["src"]
 testpaths = ["tests"]
 markers = [
+  "integration: requires the pinned Linux vLLM runtime",
   "gpu: requires a compatible GPU runtime",
 ]
 

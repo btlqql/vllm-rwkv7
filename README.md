@@ -17,12 +17,18 @@ The current implementation contains:
 - the fp32-state RWKV-7 recurrence oracle;
 - re-entrant vLLM architecture registration;
 - a correctness-first stateful vLLM model for TP=1 eager execution;
+- strict public HF config and checkpoint-key normalization;
+- validated recurrent-cache routing for chunked prefill, request reordering,
+  and released-slot reuse;
+- vLLM inner-state and prefix-caching capability contracts;
 - optional FLA recurrent-decode and chunk-prefill dispatch;
 - explicit per-GPU backend policy for V100 and newer GPU families.
 
-Linux end-to-end vLLM validation and native fused kernels are the next stages.
+Linux end-to-end checkpoint validation, scheduler soak testing, and native
+fused kernels are the next stages. The external gates are runnable but are not
+reported as passed by the dependency-light Windows suite.
 See [the design](docs/plans/2026-07-30-cleanroom-rwkv7-vllm-design.md) and
-[the implementation plan](docs/plans/2026-07-30-cleanroom-rwkv7-vllm-implementation.md).
+[the current acceptance matrix](docs/testing.md#acceptance-matrix).
 
 ## Development
 

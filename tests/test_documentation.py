@@ -39,3 +39,9 @@ def test_recorded_blackwell_result_is_passing_and_scoped() -> None:
     for row in result["rows"]:
         assert row["output"]["min_cosine"] >= 0.9999
         assert row["state"]["max_abs_diff"] <= 0.02
+
+
+def test_pull_request_ci_checks_out_the_reviewed_head_commit() -> None:
+    workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+
+    assert "ref: ${{ github.event.pull_request.head.sha || github.sha }}" in workflow

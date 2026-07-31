@@ -72,6 +72,31 @@ def test_attention_projection_may_differ_from_hidden_size() -> None:
     assert next_matrix.dtype == torch.float32
 
 
+def test_norm_bias_false_matches_bias_free_checkpoint_contract() -> None:
+    config = RWKV7ModelConfig.from_hf_config(
+        {
+            "hidden_size": 16,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 2,
+            "head_dim": 4,
+            "attention_hidden_size": 8,
+            "intermediate_size": 24,
+            "decay_low_rank_dim": 4,
+            "gate_low_rank_dim": 4,
+            "a_low_rank_dim": 4,
+            "v_low_rank_dim": 4,
+            "norm_bias": False,
+        }
+    )
+    names = set(RWKV7ReferenceLayer(config, layer_index=0).state_dict())
+
+    assert "attn.g_norm.weight" in names
+    assert "attn.g_norm.bias" not in names
+    assert "attn_norm.bias" not in names
+    assert "ffn_norm.bias" not in names
+    assert "pre_norm.bias" not in names
+
+
 def test_state_handoff_matches_contiguous_execution() -> None:
     torch.manual_seed(11)
     config = make_config()

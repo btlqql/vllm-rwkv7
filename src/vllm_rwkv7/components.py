@@ -107,6 +107,8 @@ class RWKV7TimeMix(nn.Module):
             config.attention_hidden_size,
             eps=config.head_dim * 1e-5,
         )
+        if not config.norm_bias:
+            self.g_norm.register_parameter("bias", None)
 
     def forward_token(
         self,
@@ -321,10 +323,22 @@ class RWKV7ReferenceLayer(nn.Module):
             fla_chunk_size=fla_chunk_size,
         )
         self.ffn = RWKV7ChannelMix(config)
-        self.attn_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_epsilon)
-        self.ffn_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_epsilon)
+        self.attn_norm = nn.LayerNorm(
+            config.hidden_size,
+            eps=config.layer_norm_epsilon,
+            bias=config.norm_bias,
+        )
+        self.ffn_norm = nn.LayerNorm(
+            config.hidden_size,
+            eps=config.layer_norm_epsilon,
+            bias=config.norm_bias,
+        )
         self.pre_norm = (
-            nn.LayerNorm(config.hidden_size, eps=config.layer_norm_epsilon)
+            nn.LayerNorm(
+                config.hidden_size,
+                eps=config.layer_norm_epsilon,
+                bias=config.norm_bias,
+            )
             if layer_index == 0
             else None
         )

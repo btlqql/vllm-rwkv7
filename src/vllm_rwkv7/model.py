@@ -16,10 +16,15 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from vllm.model_executor.models.interfaces import HasInnerState, IsAttentionFree
-from vllm.model_executor.models.utils import AutoWeightsLoader
+from vllm.model_executor.models.interfaces import (
+    HasInnerState,
+    IsAttentionFree,
+    SupportsMambaPrefixCaching,
+)
+from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 
+from vllm_rwkv7.cache import plan_packed_state_spans
 from vllm_rwkv7.components import RWKV7ReferenceLayer
 from vllm_rwkv7.config import RWKV7ModelConfig
 from vllm_rwkv7.kernel_policy import KernelPolicy, select_kernel_policy
@@ -173,37 +178,54 @@ class RWKV7StatefulBlock(RWKV7ReferenceLayer, MambaBase):
         if metadata.num_decode_tokens != metadata.num_decodes:
             raise NotImplementedError("RWKV-7 P0 does not support speculative multi-token decode")
 
-        query_starts = metadata.query_start_loc.tolist()
-        state_slots = metadata.state_indices_tensor.tolist()
-        sequence_lengths = metadata.seq_lens.tolist()
         shift_cache, matrix_cache = self.kv_cache
-        for request_index, state_slot in enumerate(state_slots):
-            start = int(query_starts[request_index])
-            end = int(query_starts[request_index + 1])
-            state_slot = int(state_slot)
-            if state_slot < 0 or start == end:
+        expected_shift_shape = (2, self.rwkv_config.hidden_size)
+        expected_matrix_shape = (
+            self.rwkv_config.num_attention_heads,
+            self.rwkv_config.head_dim,
+            self.rwkv_config.head_dim,
+        )
+        if tuple(shift_cache.shape[1:]) != expected_shift_shape:
+            raise ValueError(
+                "RWKV-7 shift cache has incompatible shape: "
+                f"expected [slots, {expected_shift_shape}], got {tuple(shift_cache.shape)}"
+            )
+        if tuple(matrix_cache.shape[1:]) != expected_matrix_shape:
+            raise ValueError(
+                "RWKV-7 matrix cache has incompatible shape: "
+                f"expected [slots, {expected_matrix_shape}], got {tuple(matrix_cache.shape)}"
+            )
+        if shift_cache.shape[0] != matrix_cache.shape[0]:
+            raise ValueError("RWKV-7 shift and matrix caches must have the same slot count")
+
+        spans = plan_packed_state_spans(
+            query_start_loc=metadata.query_start_loc.tolist(),
+            state_slots=metadata.state_indices_tensor.tolist(),
+            sequence_lengths=metadata.seq_lens.tolist(),
+            total_tokens=hidden_states.shape[0],
+            num_cache_slots=shift_cache.shape[0],
+        )
+        for span in spans:
+            if not span.active:
                 continue
-            query_length = end - start
-            sequence_length = int(sequence_lengths[request_index])
-            has_cached_prefix = sequence_length > query_length
-            if has_cached_prefix:
-                shift_state = shift_cache[state_slot].clone()
-                matrix_state = matrix_cache[state_slot].clone()
+            if span.has_cached_prefix:
+                shift_state = shift_cache[span.state_slot].clone()
+                matrix_state = matrix_cache[span.state_slot].clone()
             else:
-                shift_state = torch.zeros_like(shift_cache[state_slot])
-                matrix_state = torch.zeros_like(matrix_cache[state_slot])
+                shift_state = torch.zeros_like(shift_cache[span.state_slot])
+                matrix_state = torch.zeros_like(matrix_cache[span.state_slot])
             next_shift, next_matrix = self._run_sequence(
                 hidden_states,
                 value_first,
-                start,
-                end,
+                span.start,
+                span.end,
                 shift_state,
                 matrix_state,
                 output,
                 next_value_first,
             )
-            shift_cache[state_slot].copy_(next_shift)
-            matrix_cache[state_slot].copy_(next_matrix)
+            shift_cache[span.state_slot].copy_(next_shift)
+            matrix_cache[span.state_slot].copy_(next_matrix)
 
         return output, next_value_first
 
@@ -238,6 +260,7 @@ class RWKV7Model(nn.Module):
         self.norm = nn.LayerNorm(
             self.config.hidden_size,
             eps=self.config.layer_norm_epsilon,
+            bias=self.config.norm_bias,
         )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -268,13 +291,22 @@ class RWKV7Model(nn.Module):
         return self.norm(hidden_states)
 
 
-class RWKV7ForCausalLM(nn.Module, HasInnerState, IsAttentionFree):
+class RWKV7ForCausalLM(
+    nn.Module,
+    HasInnerState,
+    IsAttentionFree,
+    SupportsMambaPrefixCaching,
+):
     """vLLM CausalLM entry point for canonical HF RWKV-7 checkpoints."""
+
+    hf_to_vllm_mapper = WeightsMapper()
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
         _require_p0_execution(vllm_config)
         self.vllm_config = vllm_config
+        self.model_config = vllm_config.model_config
+        self.config = vllm_config.model_config.hf_config
         self.scheduler_config = vllm_config.scheduler_config
         self.model = RWKV7Model(vllm_config=vllm_config, prefix=prefix)
         config = self.model.config
@@ -334,4 +366,4 @@ class RWKV7ForCausalLM(nn.Module, HasInnerState, IsAttentionFree):
         return self.mamba_cache.get_seqlen_agnostic_capture_inputs(batch_size)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        return AutoWeightsLoader(self).load_weights(weights)
+        return AutoWeightsLoader(self).load_weights(weights, mapper=self.hf_to_vllm_mapper)

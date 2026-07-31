@@ -12,10 +12,11 @@ python scripts/check_provenance.py
 python -m pip wheel --no-deps . -w dist
 ```
 
-The suite covers HF configuration normalization, fp32 recurrence state,
+The suite covers strict HF configuration normalization, fp32 recurrence state,
 chunked state handoff, distinct attention/hidden sizes, checkpoint-compatible
 parameter names, plugin idempotency, packed cache-slot routing with a vLLM API
-stub, new-request cache-slot clearing, and repository author/committer identity.
+stub, request reordering, released-slot reuse, and repository author/committer
+identity.
 
 ## Current vLLM integration
 
@@ -29,12 +30,40 @@ python -m pip install -e ".[test]"
 python -m pytest tests/integration -q
 ```
 
+The contract and registry tests require only the pinned vLLM installation. A
+real eager engine load additionally requires a checkpoint and GPU:
+
+```bash
+RWKV7_VLLM_TEST_MODEL=fla-hub/rwkv7-1.5B-world \
+  python -m pytest tests/integration/test_vllm_engine.py -q
+```
+
+The engine test is deliberately skipped unless `RWKV7_VLLM_TEST_MODEL` is
+set. It performs a two-token greedy generation with TP=1 and eager execution;
+a skip is not a successful real-vLLM or GPU validation.
+
 Use `enforce_eager=True` for model loading in P0. TP, PP, compiled execution,
 and speculative decoding beyond the documented single-device path are guarded
 until their state-cache behavior has dedicated tests.
 
 Windows unit tests use a small API stub because vLLM is a Linux runtime. The
 stub is not a substitute for the Linux integration gate.
+
+## Acceptance matrix
+
+| Contract | Dependency-light verification | External verification |
+| --- | --- | --- |
+| Plugin and architecture registration | entry point metadata and re-entrant stub test | pinned Linux vLLM registry test |
+| HF configuration and checkpoint names | strict config and exact `state_dict` key tests | public checkpoint load |
+| Recurrent state and chunked prefill | PyTorch oracle, handoff, and packed-span tests | checkpoint logits and final state |
+| Dynamic batching | request reorder and released-slot reuse tests | scheduler allocation/release soak |
+| Prefix caching | marker and temporal-copy contract tests | vLLM prefix-cache run |
+| GPU execution | environment-gated test and benchmark entry points | each exact GPU model |
+
+vLLM owns cache allocation and release. The model selects state by scheduler
+slot, clears a reused slot when the query is the whole sequence, and overwrites
+the selected slot after each chunk. The local tests prove those transitions;
+only a real scheduler run can validate allocation and release integration.
 
 ## GPU matrix
 
