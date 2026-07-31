@@ -21,6 +21,7 @@ def test_distribution_metadata_and_entry_point() -> None:
     assert metadata["project"]["entry-points"]["vllm.general_plugins"] == {
         "rwkv7": "vllm_rwkv7.plugin:register"
     }
+    assert "transformers>=4.45" in metadata["project"]["dependencies"]
     assert "vllm>=0.11.1" in metadata["project"]["dependencies"]
 
 

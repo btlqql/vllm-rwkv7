@@ -92,3 +92,4 @@ def test_pull_request_ci_checks_out_the_reviewed_head_commit() -> None:
     workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
 
     assert "ref: ${{ github.event.pull_request.head.sha || github.sha }}" in workflow
+    assert "python -m pip install torch transformers pytest ruff" in workflow
