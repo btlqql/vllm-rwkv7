@@ -44,9 +44,6 @@ def test_model_constructs_and_runs_against_documented_vllm_contract(monkeypatch)
     class FakeIsAttentionFree:
         is_attention_free = True
 
-    class FakeSupportsMambaPrefixCaching:
-        supports_mamba_prefix_caching = True
-
     class FakeEmbedding(nn.Embedding):
         def __init__(self, num_embeddings, embedding_dim, **_):
             super().__init__(num_embeddings, embedding_dim)
@@ -116,7 +113,6 @@ def test_model_constructs_and_runs_against_documented_vllm_contract(monkeypatch)
         "vllm.model_executor.models.interfaces",
         HasInnerState=FakeHasInnerState,
         IsAttentionFree=FakeIsAttentionFree,
-        SupportsMambaPrefixCaching=FakeSupportsMambaPrefixCaching,
     )
     _module(
         monkeypatch,
@@ -171,7 +167,7 @@ def test_model_constructs_and_runs_against_documented_vllm_contract(monkeypatch)
     assert logits.shape == (3, 32)
     assert model.config is hf_config
     assert model.model_config is vllm_config.model_config
-    assert model.supports_mamba_prefix_caching is True
+    assert not hasattr(model, "supports_mamba_prefix_caching")
     assert model.hf_to_vllm_mapper.kwargs == {}
     public_keys = {
         "lm_head.weight",

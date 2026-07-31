@@ -20,13 +20,17 @@ The current implementation contains:
 - strict public HF config and checkpoint-key normalization;
 - validated recurrent-cache routing for chunked prefill, request reordering,
   and released-slot reuse;
-- vLLM inner-state and prefix-caching capability contracts;
+- vLLM inner-state contracts and correctness-validated `align` prefix caching;
 - optional FLA recurrent-decode and chunk-prefill dispatch;
 - explicit per-GPU backend policy for V100 and newer GPU families.
 
-Linux end-to-end checkpoint validation, scheduler soak testing, and native
-fused kernels are the next stages. The external gates are runnable but are not
-reported as passed by the dependency-light Windows suite.
+The fixed vLLM runtime has loaded an existing local 0.1B Hugging Face
+checkpoint and passed eager generation, chunked prefill, dynamic recurrent
+cache routing, and prefix-cache hit/reset/cold-equality gates on an RTX 4080
+and a Tesla V100. The exact sanitized evidence is
+[`remote_gpu_vllm_20260731.json`](bench/results/remote_gpu_vllm_20260731.json).
+Optional FLA on those two cards, compiled execution, parallel execution, and a
+long scheduler soak remain explicit follow-up gates rather than claimed work.
 See [the design](docs/plans/2026-07-30-cleanroom-rwkv7-vllm-design.md) and
 [the current acceptance matrix](docs/testing.md#acceptance-matrix).
 
@@ -38,11 +42,24 @@ python -m pytest
 python -m ruff check .
 ```
 
-The plugin targets the vLLM `main` interface at commit
-`837eae64580c885101ee95b073aafb27a485e7ce` during initial development.
+The plugin targets the vLLM `main` Python interface at commit
+`837eae64580c885101ee95b073aafb27a485e7ce`. The recorded x86_64 validation
+uses vLLM's official Python-only installation over the precompiled binary
+baseline `553fcb82d5602c75fb6ab41b6dc3c46f480c1785`; the evidence keeps those
+revisions distinct.
 P0 requests must use `enforce_eager=True` (CLI: `--enforce-eager`) with TP=1,
 PP=1, and speculative decoding disabled. Unsupported combinations fail during
 model construction.
+
+Run the real engine gate with a repository-external local checkpoint:
+
+```bash
+RWKV7_VLLM_TEST_MODEL=${HOME}/models/rwkv7-g1d-0.1b-hf \
+  python -m pytest tests/integration/test_vllm_engine.py -q
+```
+
+On a shared GPU, `RWKV7_VLLM_GPU_MEMORY_UTILIZATION` may lower the test-only
+vLLM reservation. It does not change model behavior.
 
 To test the optional FLA path on a supported GPU:
 

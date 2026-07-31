@@ -19,7 +19,6 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.model_executor.models.interfaces import (
     HasInnerState,
     IsAttentionFree,
-    SupportsMambaPrefixCaching,
 )
 from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
@@ -295,9 +294,14 @@ class RWKV7ForCausalLM(
     nn.Module,
     HasInnerState,
     IsAttentionFree,
-    SupportsMambaPrefixCaching,
 ):
-    """vLLM CausalLM entry point for canonical HF RWKV-7 checkpoints."""
+    """vLLM CausalLM entry point for canonical HF RWKV-7 checkpoints.
+
+    The reference recurrent path intentionally uses vLLM's ``align`` Mamba
+    cache mode. It does not claim the stronger ``all``-mode capability, which
+    requires the model kernel to materialize state at every cache-block
+    boundary rather than only the scheduler-selected running-state slot.
+    """
 
     hf_to_vllm_mapper = WeightsMapper()
 

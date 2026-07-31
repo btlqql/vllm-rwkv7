@@ -39,8 +39,8 @@
 - Modify: `tests/integration/test_vllm_registry.py`
 
 1. Extend the vLLM stub with `WeightsMapper` and the prefix-caching protocol.
-2. Add failing assertions for the identity mapper, public checkpoint keys, model config attributes, and prefix-cache capability.
-3. Pass the identity mapper to `AutoWeightsLoader` and expose the formal marker.
+2. Add failing assertions for the identity mapper, public checkpoint keys, model config attributes, and prefix-cache capability query.
+3. Pass the identity mapper to `AutoWeightsLoader`; retain the stronger marker only if a real engine proves its block-boundary semantics.
 4. Run the focused model and plugin contract tests.
 
 ### Task 4: Packed recurrent-state planner
@@ -70,6 +70,9 @@
 2. Add an environment-gated real-engine smoke test using a user-provided local tiny checkpoint.
 3. Document which checks are local and which require Linux vLLM or exact GPUs.
 4. Run the complete local suite and confirm external tests skip with explicit reasons.
+
+The subsequent real engine run rejected the stronger marker and validated the
+official `align` fallback with an actual cache hit and cold-output equality.
 
 ### Task 6: Final verification and publication
 

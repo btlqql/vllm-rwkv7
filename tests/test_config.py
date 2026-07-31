@@ -1,10 +1,76 @@
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import pytest
+from transformers import AutoConfig
 
 from vllm_rwkv7.config import RWKV7ModelConfig
+from vllm_rwkv7.hf_config import (
+    NativeRWKV7Config,
+    RWKV7AdapterConfig,
+    RWKV7Config,
+    register_transformers_configs,
+)
+
+
+@pytest.mark.parametrize(
+    ("model_type", "expected_class"),
+    [
+        ("rwkv7", RWKV7Config),
+        ("rwkv7_hf_adapter", RWKV7AdapterConfig),
+        ("rwkv7_native", NativeRWKV7Config),
+    ],
+)
+def test_transformers_configs_load_without_remote_code(
+    tmp_path, model_type: str, expected_class: type
+) -> None:
+    try:
+        existing_class = type(AutoConfig.for_model(model_type))
+    except ValueError:
+        existing_class = None
+    register_transformers_configs()
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": model_type,
+                "architectures": ["RWKV7ForCausalLM"],
+                "auto_map": {
+                    "AutoConfig": "unavailable_remote_module.RWKV7Config",
+                    "AutoModelForCausalLM": "unavailable_remote_module.RWKV7ForCausalLM",
+                },
+                "hidden_size": 768,
+                "num_hidden_layers": 12,
+                "num_heads": 12,
+                "head_dim": 64,
+                "intermediate_size": 3072,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    local_loaded = expected_class.from_pretrained(
+        tmp_path,
+        local_files_only=True,
+    )
+    auto_loaded = AutoConfig.from_pretrained(
+        tmp_path,
+        local_files_only=True,
+        trust_remote_code=False,
+    )
+
+    assert isinstance(local_loaded, expected_class)
+    assert local_loaded.architectures == ["RWKV7ForCausalLM"]
+    assert local_loaded.num_attention_heads == 12
+    assert local_loaded.num_heads == 12
+    if existing_class is not None and existing_class is not expected_class:
+        assert type(auto_loaded) is existing_class
+    else:
+        assert isinstance(auto_loaded, expected_class)
+        assert auto_loaded.num_attention_heads == 12
+        assert auto_loaded.num_heads == 12
+    assert auto_loaded.architectures == ["RWKV7ForCausalLM"]
 
 
 def test_canonical_transformers_head_names_are_preserved() -> None:

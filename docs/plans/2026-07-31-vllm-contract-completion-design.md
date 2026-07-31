@@ -47,7 +47,7 @@ inventing aliases. Tests lock the top-level and per-layer key contract.
 | Weight loading | matching module paths | explicit identity mapper and key tests | vLLM loader with safetensors |
 | Reference math | fp32 recurrence and sequence scan | retain token/chunk equality and validation | checkpoint logits/state |
 | Stateful cache | two state tensors and slot updates | validated spans, reorder, reuse clearing, chunk continuation | scheduler allocation/release soak |
-| Prefix caching | temporal copy functions | formal capability marker | vLLM prefix-cache run |
+| Prefix caching | temporal copy functions | reject unsupported `all` marker | real `align`-mode hit/reset/cold equality |
 | Dynamic batching | basic packed batch test | reorder and slot-reuse tests | scheduler-driven batches |
 | CI provenance | complete-history audit | check out PR head rather than synthetic merge | GitHub Actions |
 | GPU backends | optional FLA and Blackwell evidence | runnable environment-gated entry | V100 and each target GPU |
@@ -60,3 +60,8 @@ responsibility of vLLM's strict loader. Each local increment starts with a
 failing test, then runs its focused test set. Final gates are Ruff lint and
 format, the complete pytest suite, wheel build, provenance audit, identity
 audit, and a clean staged diff.
+
+The later real engine gate proved that the stronger prefix-cache marker selects
+`all` mode and is not valid for the reference recurrence. The completed design
+therefore keeps the temporal copy functions but deliberately relies on vLLM's
+`align` fallback.

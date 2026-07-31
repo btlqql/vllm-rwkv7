@@ -24,7 +24,7 @@ def test_rwkv7_uses_the_pinned_vllm_state_contract() -> None:
     assert RWKV7StatefulBlock.mamba_type.fget(object()) is MambaAttentionBackendEnum.LINEAR
     assert has_inner_state(RWKV7ForCausalLM)
     assert is_attention_free(RWKV7ForCausalLM)
-    assert supports_mamba_prefix_caching(RWKV7ForCausalLM)
+    assert not supports_mamba_prefix_caching(RWKV7ForCausalLM)
 
 
 def test_state_dtype_contract_keeps_matrix_state_in_fp32() -> None:
