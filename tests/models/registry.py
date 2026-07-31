@@ -402,6 +402,18 @@ _TEXT_GENERATION_EXAMPLE_MODELS = {
             "random": "yujiepan/mamba2-codestral-v0.1-tiny-random",
         },
     ),
+    "RWKV7ForCausalLM": _HfExamplesInfo(
+        "RWKV/RWKV7-Goose-World2.8-0.1B-HF",
+        trust_remote_code=True,
+    ),
+    "RWKV7HybridForCausalLM": _HfExamplesInfo(
+        "RWKV/RWKV7-Goose-World2.8-0.1B-HF",
+        trust_remote_code=True,
+        hf_overrides={
+            "architectures": ["RWKV7HybridForCausalLM"],
+            "attn": {"layers": [1], "num_heads": 12, "num_kv_heads": 12},
+        },
+    ),
     "FalconMambaForCausalLM": _HfExamplesInfo("tiiuae/falcon-mamba-7b-instruct"),
     "MiniCPMForCausalLM": _HfExamplesInfo(
         "openbmb/MiniCPM-2B-sft-bf16", trust_remote_code=True
