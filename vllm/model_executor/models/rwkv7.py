@@ -46,6 +46,8 @@ from vllm.model_executor.models.interfaces import (
     HasInnerState,
     IsAttentionFree,
     IsHybrid,
+    SupportsLoRA,
+    SupportsMambaPrefixCaching,
     SupportsPP,
 )
 from vllm.sequence import IntermediateTensors
@@ -55,6 +57,7 @@ from vllm.transformers_utils.configs.rwkv7 import (
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backends.linear_attn import LinearAttentionMetadata
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+from vllm.v1.attention.backends.rwkv7_attn import RWKV7AttentionMetadata
 
 from .utils import (
     AutoWeightsLoader,
@@ -65,6 +68,7 @@ from .utils import (
 
 LOG_DECAY_SCALE = -0.6065306597126334
 RWKV7_RUNTIME_DTYPE = torch.float32
+RWKV7RuntimeMetadata = LinearAttentionMetadata | RWKV7AttentionMetadata
 
 
 def get_tp_world_size() -> int:
@@ -1033,7 +1037,7 @@ class RWKV7Block(nn.Module, MambaBase):
 
     @property
     def mamba_type(self) -> MambaAttentionBackendEnum:
-        return MambaAttentionBackendEnum.LINEAR
+        return MambaAttentionBackendEnum.RWKV7
 
     def get_state_dtype(self) -> tuple[torch.dtype, ...]:
         return (
@@ -1173,6 +1177,195 @@ class RWKV7Block(nn.Module, MambaBase):
             0, slot_ids, ffn_shift_state.to(self.kv_cache[2].dtype)
         )
 
+    def _run_prefill_cache_all(
+        self,
+        hidden_states: torch.Tensor,
+        v_first: torch.Tensor | None,
+        output: torch.Tensor,
+        v_first_out: torch.Tensor,
+        metadata: RWKV7AttentionMetadata,
+    ) -> None:
+        assert self.cache_config is not None
+        assert self.cache_config.mamba_block_size is not None
+        assert metadata.query_start_loc_p is not None
+        assert metadata.num_computed_tokens_p is not None
+        assert metadata.state_indices_tensor_p is not None
+        assert metadata.block_idx_last_computed_token is not None
+
+        block_size = self.cache_config.mamba_block_size
+        query_start_loc = metadata.query_start_loc_p
+        block_tables = metadata.state_indices_tensor_p
+        last_computed_blocks = metadata.block_idx_last_computed_token[
+            metadata.num_reqs - metadata.num_prefills :
+        ]
+
+        for request_index in range(metadata.num_prefills):
+            token_start = int(query_start_loc[request_index].item())
+            token_end = int(query_start_loc[request_index + 1].item())
+            computed_tokens = int(metadata.num_computed_tokens_p[request_index].item())
+            if computed_tokens > 0:
+                initial_block = int(last_computed_blocks[request_index].item())
+                initial_slot = int(block_tables[request_index, initial_block].item())
+                states: tuple[
+                    torch.Tensor | None,
+                    torch.Tensor | None,
+                    torch.Tensor | None,
+                ] = self._get_kv_state(initial_slot, True)
+            else:
+                states = (None, None, None)
+
+            segment_start = token_start
+            while segment_start < token_end:
+                sequence_offset = computed_tokens + segment_start - token_start
+                tokens_to_boundary = block_size - sequence_offset % block_size
+                segment_end = min(segment_start + tokens_to_boundary, token_end)
+                segment_v_first = (
+                    None if v_first is None else v_first[segment_start:segment_end]
+                )
+                (
+                    segment_output,
+                    segment_v_first_out,
+                    attn_shift_state,
+                    recurrent_state,
+                    ffn_shift_state,
+                ) = self._run_sequence(
+                    hidden_states[segment_start:segment_end],
+                    segment_v_first,
+                    *states,
+                )
+                output[segment_start:segment_end] = segment_output
+                v_first_out[segment_start:segment_end, : self.local_value_dim] = (
+                    segment_v_first_out
+                )
+
+                sequence_end = computed_tokens + segment_end - token_start
+                output_block = (sequence_end - 1) // block_size
+                output_slot = int(block_tables[request_index, output_block].item())
+                self._store_kv_state(
+                    output_slot,
+                    attn_shift_state,
+                    recurrent_state,
+                    ffn_shift_state,
+                )
+                states = (attn_shift_state, recurrent_state, ffn_shift_state)
+                segment_start = segment_end
+
+    def _forward_runtime_rwkv_metadata(
+        self,
+        hidden_states: torch.Tensor,
+        v_first: torch.Tensor | None,
+        output: torch.Tensor,
+        v_first_out: torch.Tensor,
+        metadata: RWKV7AttentionMetadata,
+    ) -> None:
+        num_actual_tokens = metadata.num_decode_tokens + metadata.num_prefill_tokens
+        hidden_states = hidden_states[:num_actual_tokens]
+        if v_first is not None:
+            v_first = v_first[:num_actual_tokens]
+
+        output_slice = output[:num_actual_tokens]
+        v_first_slice = v_first_out[:num_actual_tokens]
+        if v_first is None:
+            v_first_slice.zero_()
+        else:
+            v_first_slice.copy_(v_first)
+
+        cache_all = (
+            self.cache_config is not None
+            and self.cache_config.mamba_cache_mode == "all"
+        )
+        if metadata.num_decode_tokens > 0:
+            assert metadata.num_decode_tokens == metadata.num_decodes
+            assert metadata.state_indices_tensor_d is not None
+            decode_state_indices = metadata.state_indices_tensor_d[
+                : metadata.num_decode_tokens
+            ]
+            if cache_all:
+                assert decode_state_indices.ndim == 2
+                assert metadata.block_idx_last_computed_token is not None
+                assert metadata.block_idx_last_scheduled_token is not None
+                input_blocks = metadata.block_idx_last_computed_token[
+                    : metadata.num_decode_tokens
+                ]
+                output_blocks = metadata.block_idx_last_scheduled_token[
+                    : metadata.num_decode_tokens
+                ]
+                decode_input_slots = decode_state_indices.gather(
+                    1, input_blocks[:, None]
+                ).squeeze(1)
+                decode_output_slots = decode_state_indices.gather(
+                    1, output_blocks[:, None]
+                ).squeeze(1)
+            else:
+                decode_input_slots = decode_state_indices.flatten()
+                decode_output_slots = decode_input_slots
+
+            decode_input_slots = decode_input_slots.to(dtype=torch.long)
+            decode_output_slots = decode_output_slots.to(dtype=torch.long)
+            states = self._get_kv_states(decode_input_slots)
+            out, vf_out, attn_shift, recurrent, ffn_shift = self._run_decode_batch(
+                hidden_states[: metadata.num_decode_tokens],
+                (None if v_first is None else v_first[: metadata.num_decode_tokens]),
+                *states,
+            )
+            output_slice[: metadata.num_decode_tokens] = out
+            v_first_slice[: metadata.num_decode_tokens, : self.local_value_dim] = vf_out
+            self._store_kv_states(
+                decode_output_slots,
+                attn_shift,
+                recurrent,
+                ffn_shift,
+            )
+
+        if metadata.num_prefills == 0:
+            return
+
+        prefill_token_offset = metadata.num_decode_tokens
+        assert metadata.query_start_loc_p is not None
+        if cache_all:
+            self._run_prefill_cache_all(
+                hidden_states[prefill_token_offset:num_actual_tokens],
+                (
+                    None
+                    if v_first is None
+                    else v_first[prefill_token_offset:num_actual_tokens]
+                ),
+                output_slice[prefill_token_offset:num_actual_tokens],
+                v_first_slice[prefill_token_offset:num_actual_tokens],
+                metadata,
+            )
+            return
+
+        assert metadata.state_indices_tensor_p is not None
+        prefill_slot_ids = metadata.state_indices_tensor_p.flatten().to(
+            dtype=torch.long
+        )
+        assert metadata.has_initial_states_p is not None
+        states = self._get_prefill_kv_states(
+            prefill_slot_ids,
+            metadata.has_initial_states_p,
+        )
+        out, vf_out, attn_shift, recurrent, ffn_shift = self._run_prefill_batch(
+            hidden_states[prefill_token_offset:num_actual_tokens],
+            (
+                None
+                if v_first is None
+                else v_first[prefill_token_offset:num_actual_tokens]
+            ),
+            metadata.query_start_loc_p,
+            *states,
+        )
+        output_slice[prefill_token_offset:num_actual_tokens] = out
+        v_first_slice[
+            prefill_token_offset:num_actual_tokens, : self.local_value_dim
+        ] = vf_out
+        self._store_kv_states(
+            prefill_slot_ids,
+            attn_shift,
+            recurrent,
+            ffn_shift,
+        )
+
     def _run_decode_batch(
         self,
         hidden_states: torch.Tensor,
@@ -1255,7 +1448,7 @@ class RWKV7Block(nn.Module, MambaBase):
         v_first: torch.Tensor | None,
         output: torch.Tensor,
         v_first_out: torch.Tensor,
-        attn_metadata: LinearAttentionMetadata | None = None,
+        attn_metadata: RWKV7RuntimeMetadata | None = None,
     ) -> None:
         logical_v_first = (
             None if v_first is None else v_first[..., : self.local_value_dim]
@@ -1279,7 +1472,8 @@ class RWKV7Block(nn.Module, MambaBase):
                 assert isinstance(runtime_attn_metadata, dict)
                 maybe_metadata = runtime_attn_metadata.get(self.prefix)
                 assert maybe_metadata is None or isinstance(
-                    maybe_metadata, LinearAttentionMetadata
+                    maybe_metadata,
+                    (LinearAttentionMetadata, RWKV7AttentionMetadata),
                 )
                 attn_metadata = maybe_metadata
 
@@ -1289,6 +1483,16 @@ class RWKV7Block(nn.Module, MambaBase):
             )
             output[: out.shape[0]] = out
             store_v_first(v_first_out[: vf_out.shape[0]], vf_out, v_first)
+            return
+
+        if isinstance(attn_metadata, RWKV7AttentionMetadata):
+            self._forward_runtime_rwkv_metadata(
+                hidden_states,
+                logical_v_first,
+                output,
+                v_first_out,
+                attn_metadata,
+            )
             return
 
         num_actual_tokens = (
@@ -1381,7 +1585,7 @@ class RWKV7Block(nn.Module, MambaBase):
         self,
         hidden_states: torch.Tensor,
         v_first: torch.Tensor | None,
-        attn_metadata: LinearAttentionMetadata | None = None,
+        attn_metadata: RWKV7RuntimeMetadata | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         output = torch.empty_like(hidden_states)
         v_first_out = torch.empty(
@@ -1482,7 +1686,7 @@ class RWKV7HybridBlock(nn.Module, MambaBase):
 
     @property
     def mamba_type(self) -> MambaAttentionBackendEnum:
-        return MambaAttentionBackendEnum.LINEAR
+        return MambaAttentionBackendEnum.RWKV7
 
     def get_state_dtype(self) -> tuple[torch.dtype, ...]:
         return (
@@ -1519,8 +1723,8 @@ class RWKV7HybridBlock(nn.Module, MambaBase):
         self.kv_cache[2].index_copy_(0, slot_ids, states.to(self.kv_cache[2].dtype))
 
     def _resolve_linear_metadata(
-        self, attn_metadata: LinearAttentionMetadata | None
-    ) -> LinearAttentionMetadata | None:
+        self, attn_metadata: RWKV7RuntimeMetadata | None
+    ) -> RWKV7RuntimeMetadata | None:
         if attn_metadata is not None or not is_forward_context_available():
             return attn_metadata
         runtime_metadata = get_forward_context().attn_metadata
@@ -1530,7 +1734,8 @@ class RWKV7HybridBlock(nn.Module, MambaBase):
             raise TypeError("Hybrid RWKV7 expects per-layer attention metadata.")
         maybe_metadata = runtime_metadata.get(self.prefix)
         if maybe_metadata is not None and not isinstance(
-            maybe_metadata, LinearAttentionMetadata
+            maybe_metadata,
+            (LinearAttentionMetadata, RWKV7AttentionMetadata),
         ):
             raise TypeError("Hybrid RWKV7 FFN metadata must be linear metadata.")
         return maybe_metadata
@@ -1538,12 +1743,15 @@ class RWKV7HybridBlock(nn.Module, MambaBase):
     def _run_ffn(
         self,
         hidden_states: torch.Tensor,
-        attn_metadata: LinearAttentionMetadata | None,
+        attn_metadata: RWKV7RuntimeMetadata | None,
     ) -> torch.Tensor:
         attn_metadata = self._resolve_linear_metadata(attn_metadata)
         if attn_metadata is None:
             output, _ = self.ffn(hidden_states, None)
             return output
+
+        if isinstance(attn_metadata, RWKV7AttentionMetadata):
+            return self._run_ffn_rwkv_metadata(hidden_states, attn_metadata)
 
         num_actual_tokens = (
             attn_metadata.num_decode_tokens + attn_metadata.num_prefill_tokens
@@ -1586,12 +1794,130 @@ class RWKV7HybridBlock(nn.Module, MambaBase):
             self._store_ffn_states(prefill_slot_ids, prefill_states)
         return output
 
+    def _run_ffn_prefill_cache_all(
+        self,
+        hidden_states: torch.Tensor,
+        output: torch.Tensor,
+        metadata: RWKV7AttentionMetadata,
+    ) -> None:
+        assert self.cache_config is not None
+        assert self.cache_config.mamba_block_size is not None
+        assert metadata.query_start_loc_p is not None
+        assert metadata.num_computed_tokens_p is not None
+        assert metadata.state_indices_tensor_p is not None
+        assert metadata.block_idx_last_computed_token is not None
+
+        block_size = self.cache_config.mamba_block_size
+        query_start_loc = metadata.query_start_loc_p
+        block_tables = metadata.state_indices_tensor_p
+        last_computed_blocks = metadata.block_idx_last_computed_token[
+            metadata.num_reqs - metadata.num_prefills :
+        ]
+
+        for request_index in range(metadata.num_prefills):
+            token_start = int(query_start_loc[request_index].item())
+            token_end = int(query_start_loc[request_index + 1].item())
+            computed_tokens = int(metadata.num_computed_tokens_p[request_index].item())
+            state = None
+            if computed_tokens > 0:
+                initial_block = int(last_computed_blocks[request_index].item())
+                initial_slot = block_tables[request_index, initial_block].long()
+                state = self._get_ffn_states(initial_slot[None])[0]
+
+            segment_start = token_start
+            while segment_start < token_end:
+                sequence_offset = computed_tokens + segment_start - token_start
+                tokens_to_boundary = block_size - sequence_offset % block_size
+                segment_end = min(segment_start + tokens_to_boundary, token_end)
+                segment_output, state = self.ffn(
+                    hidden_states[segment_start:segment_end], state
+                )
+                output[segment_start:segment_end] = segment_output
+
+                sequence_end = computed_tokens + segment_end - token_start
+                output_block = (sequence_end - 1) // block_size
+                output_slot = block_tables[request_index, output_block].long()
+                self._store_ffn_states(output_slot[None], state[None])
+                segment_start = segment_end
+
+    def _run_ffn_rwkv_metadata(
+        self,
+        hidden_states: torch.Tensor,
+        metadata: RWKV7AttentionMetadata,
+    ) -> torch.Tensor:
+        num_actual_tokens = metadata.num_decode_tokens + metadata.num_prefill_tokens
+        output = torch.zeros_like(hidden_states)
+        cache_all = (
+            self.cache_config is not None
+            and self.cache_config.mamba_cache_mode == "all"
+        )
+
+        if metadata.num_decode_tokens > 0:
+            assert metadata.num_decode_tokens == metadata.num_decodes
+            assert metadata.state_indices_tensor_d is not None
+            decode_state_indices = metadata.state_indices_tensor_d[
+                : metadata.num_decode_tokens
+            ]
+            if cache_all:
+                assert metadata.block_idx_last_computed_token is not None
+                assert metadata.block_idx_last_scheduled_token is not None
+                input_blocks = metadata.block_idx_last_computed_token[
+                    : metadata.num_decode_tokens
+                ]
+                output_blocks = metadata.block_idx_last_scheduled_token[
+                    : metadata.num_decode_tokens
+                ]
+                decode_input_slots = decode_state_indices.gather(
+                    1, input_blocks[:, None]
+                ).squeeze(1)
+                decode_output_slots = decode_state_indices.gather(
+                    1, output_blocks[:, None]
+                ).squeeze(1)
+            else:
+                decode_input_slots = decode_state_indices[:, 0]
+                decode_output_slots = decode_input_slots
+
+            decode_states = self._get_ffn_states(decode_input_slots.long())
+            decode_output, decode_states = self.ffn.forward_decode_batch(
+                hidden_states[: metadata.num_decode_tokens], decode_states
+            )
+            output[: metadata.num_decode_tokens] = decode_output
+            self._store_ffn_states(decode_output_slots.long(), decode_states)
+
+        if metadata.num_prefills == 0:
+            return output
+
+        prefill_token_offset = metadata.num_decode_tokens
+        if cache_all:
+            self._run_ffn_prefill_cache_all(
+                hidden_states[prefill_token_offset:num_actual_tokens],
+                output[prefill_token_offset:num_actual_tokens],
+                metadata,
+            )
+            return output
+
+        assert metadata.state_indices_tensor_p is not None
+        assert metadata.query_start_loc_p is not None
+        assert metadata.has_initial_states_p is not None
+        prefill_slot_ids = metadata.state_indices_tensor_p.flatten().long()
+        prefill_states = self._get_ffn_states(
+            prefill_slot_ids, metadata.has_initial_states_p
+        )
+        prefill_output, prefill_states = self.ffn.forward_prefill_batch(
+            hidden_states[prefill_token_offset:num_actual_tokens],
+            metadata.query_start_loc_p,
+            prefill_states,
+        )
+        output[prefill_token_offset:num_actual_tokens] = prefill_output
+        self._store_ffn_states(prefill_slot_ids, prefill_states)
+        return output
+
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         v_first: torch.Tensor | None,
-        attn_metadata: LinearAttentionMetadata | None = None,
+        attn_metadata: RWKV7RuntimeMetadata | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         residual = hidden_states
         if self.pre_norm is not None:
@@ -1730,7 +2056,8 @@ class RWKV7Model(nn.Module):
                 None if attn_metadata is None else attn_metadata.get(layer.prefix)
             )
             assert layer_metadata is None or isinstance(
-                layer_metadata, LinearAttentionMetadata
+                layer_metadata,
+                (LinearAttentionMetadata, RWKV7AttentionMetadata),
             )
             if isinstance(layer, RWKV7HybridBlock):
                 hidden_states, v_first = layer(
@@ -1765,13 +2092,19 @@ class RWKV7ForCausalLM(
     nn.Module,
     HasInnerState,
     IsAttentionFree,
+    SupportsLoRA,
     SupportsPP,
+    SupportsMambaPrefixCaching,
 ):
     # RWKV7 keeps the checkpoint's linear projections separate, so there are
     # no packed-module rewrites to describe.  The attribute is still required
     # by weight-rewriting loaders such as BitsAndBytes; an explicit empty map
     # declares that checkpoint and vLLM module names match one-to-one.
     packed_modules_mapping: dict[str, list[str]] = {}
+    embedding_modules = {
+        "embed_tokens": "input_embeddings",
+        "lm_head": "output_embeddings",
+    }
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()

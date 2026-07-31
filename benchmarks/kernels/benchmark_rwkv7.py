@@ -72,6 +72,13 @@ def parse_args() -> argparse.Namespace:
         "--require-exact", action=argparse.BooleanOptionalAction, default=True
     )
     parser.add_argument(
+        "--prefix-cache", action=argparse.BooleanOptionalAction, default=False
+    )
+    parser.add_argument(
+        "--require-prefix-hit", action=argparse.BooleanOptionalAction, default=True
+    )
+    parser.add_argument("--mamba-cache-mode", choices=("align", "all"), default="all")
+    parser.add_argument(
         "--candidate-backend", choices=("auto", "triton"), default="triton"
     )
     parser.add_argument(
@@ -135,6 +142,7 @@ def serialize_logprobs(logprobs: Any) -> list[list[dict[str, Any]]]:
 def run_worker(args: argparse.Namespace) -> None:
     assert args.worker is not None
     os.environ["VLLM_RWKV7_KERNEL"] = args.worker
+    os.environ.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
 
     import torch
 
@@ -159,6 +167,11 @@ def run_worker(args: argparse.Namespace) -> None:
         llm_kwargs["skip_tokenizer_init"] = True
     else:
         llm_kwargs["tokenizer"] = args.tokenizer or args.model
+    if args.prefix_cache:
+        llm_kwargs.update(
+            enable_prefix_caching=True,
+            mamba_cache_mode=args.mamba_cache_mode,
+        )
     llm = LLM(
         model=args.model,
         dtype=args.dtype,
@@ -180,6 +193,16 @@ def run_worker(args: argparse.Namespace) -> None:
     )
     for _ in range(args.warmup_runs):
         llm.generate(prompts, sampling_params, use_tqdm=False)
+    if args.prefix_cache and args.warmup_runs and not llm.reset_prefix_cache():
+        raise RuntimeError("prefix cache could not be reset after warmup")
+
+    prefix_cache_report = None
+    cold_signature = None
+    if args.prefix_cache:
+        cold_started = time.perf_counter()
+        cold_outputs = llm.generate(prompts, sampling_params, use_tqdm=False)
+        cold_elapsed = time.perf_counter() - cold_started
+        cold_signature = [tuple(item.outputs[0].token_ids) for item in cold_outputs]
     samples = []
     signatures = []
     outputs = None
@@ -190,7 +213,31 @@ def run_worker(args: argparse.Namespace) -> None:
         signatures.append([tuple(item.outputs[0].token_ids) for item in outputs])
     assert outputs is not None
     if any(signature != signatures[0] for signature in signatures[1:]):
-        raise RuntimeError(f"{args.worker} output changed across repeated runs")
+        raise RuntimeError(
+            f"{args.worker} output changed across repeated runs: {signatures}"
+        )
+    if cold_signature is not None:
+        hit_cached_tokens = [int(item.num_cached_tokens or 0) for item in outputs]
+        prefix_cache_report = {
+            "mode": args.mamba_cache_mode,
+            "cold_elapsed_s": cold_elapsed,
+            "hit_elapsed_s": statistics.median(samples),
+            "speedup": cold_elapsed / statistics.median(samples),
+            "num_cached_tokens": hit_cached_tokens,
+            "cold_hit_exact": cold_signature == signatures[0],
+        }
+        if not prefix_cache_report["cold_hit_exact"]:
+            raise RuntimeError(
+                f"{args.worker} prefix-cache output changed: "
+                f"cold={cold_signature}, hit={signatures[0]}, "
+                f"cached={hit_cached_tokens}"
+            )
+        if args.require_prefix_hit and not all(
+            count > 0 for count in hit_cached_tokens
+        ):
+            raise RuntimeError(
+                f"{args.worker} produced no prefix-cache hit: {hit_cached_tokens}"
+            )
     elapsed = statistics.median(samples)
     if torch.accelerator.is_available():
         torch.accelerator.synchronize()
@@ -229,6 +276,7 @@ def run_worker(args: argparse.Namespace) -> None:
                     if decode_s is None or decode_s <= 0 or num_output_tokens <= 1
                     else (num_output_tokens - 1) / decode_s
                 ),
+                "num_cached_tokens": int(item.num_cached_tokens or 0),
             }
         )
     result = {
@@ -247,6 +295,7 @@ def run_worker(args: argparse.Namespace) -> None:
             "vllm": vllm.__version__,
         },
         "request_metrics": request_metrics,
+        "prefix_cache": prefix_cache_report,
         "requests": [
             {
                 "token_ids": list(item.outputs[0].token_ids),
@@ -287,6 +336,11 @@ def run_backend(args: argparse.Namespace, backend: str) -> dict[str, Any]:
         "--async-scheduling" if args.async_scheduling else "--no-async-scheduling"
     )
     command.append("--ignore-eos" if args.ignore_eos else "--no-ignore-eos")
+    command.append("--prefix-cache" if args.prefix_cache else "--no-prefix-cache")
+    command.append(
+        "--require-prefix-hit" if args.require_prefix_hit else "--no-require-prefix-hit"
+    )
+    command.extend(["--mamba-cache-mode", args.mamba_cache_mode])
     command.extend(["--worker", backend])
 
     result = None
@@ -422,6 +476,8 @@ def main() -> None:
                 "repeats": args.repeats,
                 "candidate_backend": args.candidate_backend,
                 "prompt_count": len(load_prompts(args)),
+                "prefix_cache": args.prefix_cache,
+                "mamba_cache_mode": args.mamba_cache_mode,
             },
             "torch": torch_result,
             "candidate": candidate_result,

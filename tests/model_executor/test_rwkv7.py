@@ -43,6 +43,10 @@ from vllm.model_executor.models.config import (
     HybridAttentionMambaModelConfig,
     MambaModelConfig,
 )
+from vllm.model_executor.models.interfaces import (
+    supports_lora,
+    supports_mamba_prefix_caching,
+)
 from vllm.model_executor.models.rwkv7 import (
     RWKV7Attention,
     RWKV7Block,
@@ -52,6 +56,7 @@ from vllm.model_executor.models.rwkv7 import (
 )
 from vllm.transformers_utils.configs.rwkv7 import RWKV7Config
 from vllm.v1.attention.backends.linear_attn import LinearAttentionMetadata
+from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 
 try:
@@ -1084,8 +1089,25 @@ def test_rwkv7_hybrid_block_constructs_attention_and_ffn_state():
             cleanup_dist_env_and_memory()
 
 
-def test_rwkv7_does_not_declare_mamba_prefix_caching_support():
-    assert getattr(RWKV7ForCausalLM, "supports_mamba_prefix_caching", False) is False
+def test_rwkv7_declares_mamba_prefix_caching_support():
+    assert supports_mamba_prefix_caching(RWKV7ForCausalLM)
+    assert supports_mamba_prefix_caching(RWKV7HybridForCausalLM)
+
+
+def test_rwkv7_declares_runtime_lora_support():
+    assert supports_lora(RWKV7ForCausalLM)
+    assert supports_lora(RWKV7HybridForCausalLM)
+    assert RWKV7ForCausalLM.embedding_modules == {
+        "embed_tokens": "input_embeddings",
+        "lm_head": "output_embeddings",
+    }
+
+
+def test_rwkv7_uses_block_aware_attention_metadata():
+    block = object.__new__(RWKV7Block)
+    assert block.mamba_type is MambaAttentionBackendEnum.RWKV7
+    hybrid_block = object.__new__(RWKV7HybridBlock)
+    assert hybrid_block.mamba_type is MambaAttentionBackendEnum.RWKV7
 
 
 def test_rwkv7_declares_bitsandbytes_weight_mapping_contract():
@@ -1197,7 +1219,7 @@ def test_rwkv7_compute_logits_preserves_activation_dtype_for_quantized_head(
     assert output.dtype == expected_hidden_dtype
 
 
-def test_rwkv7_prefix_caching_defaults_to_align(tmp_path: Path, monkeypatch):
+def test_rwkv7_prefix_caching_defaults_to_all(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("VLLM_CACHE_ROOT", str(tmp_path / "vllm_cache"))
 
     model_path = _write_test_model_config(tmp_path)
@@ -1219,14 +1241,14 @@ def test_rwkv7_prefix_caching_defaults_to_align(tmp_path: Path, monkeypatch):
         device_config=DeviceConfig("cpu"),
     )
 
-    assert vllm_config.model_config.supports_mamba_prefix_caching is False
-    assert vllm_config.cache_config.mamba_cache_mode == "align"
+    assert vllm_config.model_config.supports_mamba_prefix_caching is True
+    assert vllm_config.cache_config.mamba_cache_mode == "all"
     assert vllm_config.cache_config.mamba_block_size == (
         vllm_config.cache_config.block_size
     )
 
 
-def test_rwkv7_prefix_caching_all_mode_falls_back_to_align(tmp_path: Path, monkeypatch):
+def test_rwkv7_prefix_caching_keeps_explicit_all_mode(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("VLLM_CACHE_ROOT", str(tmp_path / "vllm_cache"))
 
     model_path = _write_test_model_config(tmp_path)
@@ -1248,8 +1270,8 @@ def test_rwkv7_prefix_caching_all_mode_falls_back_to_align(tmp_path: Path, monke
         device_config=DeviceConfig("cpu"),
     )
 
-    assert vllm_config.model_config.supports_mamba_prefix_caching is False
-    assert vllm_config.cache_config.mamba_cache_mode == "align"
+    assert vllm_config.model_config.supports_mamba_prefix_caching is True
+    assert vllm_config.cache_config.mamba_cache_mode == "all"
 
 
 def test_rwkv7_block_uses_fp32_runtime_state_dtype():

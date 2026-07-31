@@ -112,6 +112,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-memory-reduction", type=float, default=0.01)
     parser.add_argument("--min-token-agreement", type=float, default=1.0)
     parser.add_argument(
+        "--online-int8-target-regex",
+        help=(
+            "Full-match regex selecting LinearBase modules for online INT8; "
+            "all other linear modules stay in the model dtype."
+        ),
+    )
+    parser.add_argument(
         "--jsonl-out",
         type=Path,
         help="Append one machine-readable benchmark record to this JSONL file.",
@@ -202,6 +209,9 @@ def run_worker(args: argparse.Namespace) -> None:
 
         if hasattr(online_quant_config, "QuantizationConfigArgs"):
             quantization_config = {"linear": "int8_per_channel_static"}
+            if args.online_int8_target_regex is not None:
+                target = args.online_int8_target_regex
+                quantization_config["ignore"] = [rf"re:^(?!(?:{target})$).*"]
         else:
             quantization_config = {
                 "linear_scheme_override": "int8_per_channel_weight_only"
@@ -379,6 +389,7 @@ def run_worker(args: argparse.Namespace) -> None:
         "generated_token_logprobs": generated_token_logprobs,
         "repeatable": repeat_mismatch is None,
         "repeat_mismatch": repeat_mismatch,
+        "online_int8_target_regex": args.online_int8_target_regex,
         "requests": [list(item.outputs[0].token_ids) for item in outputs],
     }
     print("RESULT_JSON " + json.dumps(result), flush=True)
@@ -429,6 +440,8 @@ def run_setting(args: argparse.Namespace, setting: str) -> dict[str, Any]:
         command.extend(["--prompt-token-length", str(prompt_token_length)])
     if args.prompts_file is not None:
         command.extend(["--prompts-file", str(args.prompts_file)])
+    if args.online_int8_target_regex is not None:
+        command.extend(["--online-int8-target-regex", args.online_int8_target_regex])
     command.append("--enforce-eager" if args.enforce_eager else "--no-enforce-eager")
     command.append(
         "--async-scheduling" if args.async_scheduling else "--no-async-scheduling"
@@ -567,6 +580,28 @@ def compare_with_reference(
     }
 
 
+def compact_result(result: dict[str, Any]) -> dict[str, Any]:
+    """Keep JSONL evidence useful without duplicating token/logprob arrays."""
+    keys = (
+        "supported",
+        "unsupported_reason",
+        "dtype",
+        "model",
+        "model_memory_gib",
+        "output_tok_s",
+        "total_tok_s",
+        "input_tokens",
+        "output_tokens",
+        "elapsed_s",
+        "samples_s",
+        "repeatable",
+        "repeat_mismatch",
+        "online_int8_target_regex",
+        "engine_memory",
+    )
+    return {key: result[key] for key in keys if key in result}
+
+
 def main() -> None:
     args = parse_args()
     if args.worker_setting is not None:
@@ -585,35 +620,12 @@ def main() -> None:
     ]
     report = {"results": results, "comparisons": comparisons}
     print(json.dumps(report, indent=2))
-    if args.jsonl_out is not None:
-        args.jsonl_out.parent.mkdir(parents=True, exist_ok=True)
-        record = {
-            "schema": "rwkv7-quantization-benchmark-v1",
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "tag": args.benchmark_tag,
-            "parameters": {
-                "model": args.model,
-                "dtype": args.dtype,
-                "settings": args.settings,
-                "max_tokens": args.max_tokens,
-                "max_model_len": args.max_model_len,
-                "max_num_batched_tokens": args.max_num_batched_tokens,
-                "warmup_runs": args.warmup_runs,
-                "repeats": args.repeats,
-                "prompt_count": len(load_prompts(args)),
-            },
-            **report,
-        }
-        with args.jsonl_out.open("a", encoding="utf-8") as output_file:
-            output_file.write(json.dumps(record, sort_keys=True) + "\n")
 
-    failed = []
-    if args.require_gates:
-        failed.extend(
-            f"{setting} unsupported"
-            for setting in args.settings
-            if setting != "fp16" and not results[setting].get("supported", True)
-        )
+    failed = [
+        f"{setting} unsupported"
+        for setting in args.settings
+        if setting != "fp16" and not results[setting].get("supported", True)
+    ]
     for comparison in comparisons:
         if comparison["speed_ratio"] < args.min_speed_ratio:
             failed.append(
@@ -627,6 +639,45 @@ def main() -> None:
                 f"{comparison['setting']} "
                 f"token_agreement={comparison['token_agreement']:.4f}"
             )
+
+    if args.jsonl_out is not None:
+        args.jsonl_out.parent.mkdir(parents=True, exist_ok=True)
+        identity = next(
+            (
+                result
+                for result in results.values()
+                if result.get("supported", True) and result.get("gpu") is not None
+            ),
+            {},
+        )
+        record = {
+            "schema": "rwkv7-quantization-benchmark-v1",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "tag": args.benchmark_tag,
+            "gpu": identity.get("gpu"),
+            "software": identity.get("software"),
+            "parameters": {
+                "model": args.model,
+                "dtype": args.dtype,
+                "settings": args.settings,
+                "max_tokens": args.max_tokens,
+                "max_model_len": args.max_model_len,
+                "max_num_batched_tokens": args.max_num_batched_tokens,
+                "warmup_runs": args.warmup_runs,
+                "repeats": args.repeats,
+                "prompt_count": len(load_prompts(args)),
+                "online_int8_target_regex": args.online_int8_target_regex,
+            },
+            "results": {
+                setting: compact_result(result) for setting, result in results.items()
+            },
+            "comparisons": comparisons,
+            "gate_passed": not failed,
+            "failed_gates": failed,
+        }
+        with args.jsonl_out.open("a", encoding="utf-8") as output_file:
+            output_file.write(json.dumps(record, sort_keys=True) + "\n")
+
     if args.require_gates and failed:
         print("FAILED_GATES " + "; ".join(failed), file=sys.stderr)
         raise SystemExit(1)

@@ -25,10 +25,12 @@ no unsupported default promotion.
 
 RWKV-7 already implements vLLM's `HasInnerState` contract and supplies state
 shape, dtype, and copy functions. Prefix caching therefore uses the existing
-Mamba block manager by declaring `SupportsMambaPrefixCaching`; the scheduler
-stores and restores the three RWKV state tensors at aligned block boundaries.
-No scheduler or cache-engine fork is introduced. Pure RWKV uses Mamba cache
-mode `all`; hybrid attention/RWKV uses the framework's hybrid alignment rules.
+Mamba block manager by declaring `SupportsMambaPrefixCaching`. An RWKV-specific
+metadata builder preserves and restores the three recurrent state tensors at
+every allocated block boundary. The same block-aware path handles pure RWKV
+attention state and the recurrent FFN state in hybrid attention/RWKV models.
+No scheduler or cache-engine fork is introduced, and both forms use Mamba cache
+mode `all`.
 
 Runtime LoRA uses `SupportsLoRA` on both pure and hybrid causal-LM classes. The
 model exposes its un-packed linear topology and embedding/output module names
@@ -37,13 +39,13 @@ ordinary base-model submodules. User adapters target the actual leaf linears,
 for example attention projections and FFN key/value projections, using their
 normal PEFT names.
 
-Quantization stays behind vLLM's quantization configuration. Profiling first
-separates recurrent-scan time from linear time and identifies which matrix
-families are large enough to amortize dequantization. A selective speed policy
-quantizes only profitable modules; the memory policy may quantize more modules
-but is reported separately. If the available generic kernels cannot beat the
-16-bit row, the design permits an RWKV-shaped fused weight-only GEMV kernel,
-but only after a correctness oracle and representative shape sweep exist.
+Quantization stays behind vLLM's quantization configuration. The benchmark can
+full-match a requested module-name regex so memory and selective-speed rows
+state exactly which modules were quantized. A selective speed row quantizes
+only profitable modules; the memory row may quantize more modules but is
+reported separately. If the available generic kernels cannot beat the 16-bit
+row, the design permits an RWKV-shaped fused weight-only GEMV kernel, but only
+after a correctness oracle and representative shape sweep exist.
 
 ## Failure handling and rollout
 
@@ -86,3 +88,34 @@ Static completion requires Ruff, format, mypy-compatible annotations,
 markdownlint, `git diff --check`, focused pytest, valid JSONL, and the inherited
 GitHub pre-commit workflow. Model-affecting changes additionally require the
 existing reference-parity and deterministic long-horizon gates.
+
+## Completion evidence and claim boundaries
+
+The RTX 4080 engine gates pass for both pure and hybrid models. Pure RWKV-7
+reuses 112 prompt tokens and produces an exact cold/hit continuation. The
+hybrid model reuses 2048 prompt tokens, also exactly, and reduces the Torch
+prefill-plus-decode row from 1.586 seconds to 0.051 seconds. Both paths use
+block-aware `all` mode. Multi-request rows also pass exactly: pure RWKV-7 at
+batch four and prompt 512 reuses 496 tokens per request, while the hybrid model
+at batch two reuses 2048 tokens per request.
+
+Runtime LoRA rank-8 adapters targeting
+`model.layers.0.attn.r_proj` pass load, two-adapter switching, removal, and
+exact base-output restoration for both pure and hybrid models. The model table
+advertises LoRA only after these engine rows passed.
+
+Quantization claims remain deliberately narrower. Full online INT8 and the W4
+rows reduce model footprint but fail either throughput or token gates, so they
+remain memory/compatibility lanes. On RTX 4080 with the real 1.5B checkpoint,
+online INT8 restricted to `lm_head` passes the batch-one, prompt-128,
+decode-64 gate: model memory falls from 2.85 GiB to 2.72 GiB, throughput rises
+from 49.67 to 50.78 output tokens/s, and all tokens agree. The same setting at
+batch four reaches only 0.9535x fp16 throughput and 0.8008 token agreement, so
+it is recorded as a failed gate and is not a general default.
+
+All exact rows, including negative W8/W4 results, are in
+`benchmarks/results/rwkv7_20260731.jsonl`. The dual V100 functional,
+tensor-parallel, and pipeline-parallel rows remain valid. A fresh V100
+prefix/LoRA rerun was not forced while both shared cards were occupied; no
+process was terminated and no new V100 capability claim is made from the RTX
+4080 evidence.
