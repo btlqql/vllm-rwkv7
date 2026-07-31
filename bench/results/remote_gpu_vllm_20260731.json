@@ -1,0 +1,125 @@
+{
+  "checkpoint_contract": {
+    "additional_local_checkpoints_inspected": [
+      {
+        "architecture": "RWKV7ForCausalLM",
+        "filename": "rwkv7-g1d-0.4b-hf/model.safetensors",
+        "model_type": "rwkv7_hf_adapter",
+        "normalized_key_templates": 39,
+        "sha256": "8aa0fb580a0c5d442b28f63b9b08c2c60a81821f7c60e79307c11a1a3a2693e0",
+        "size_bytes": 901619536,
+        "tensor_keys": 795
+      },
+      {
+        "architecture": "RWKV7ForCausalLM",
+        "filename": "rwkv7-g1g-1.5b-hf/model.safetensors",
+        "model_type": "rwkv7_hf_adapter",
+        "normalized_key_templates": 39,
+        "sha256": "d580d0c687d4e7e6c86985c61418712fc2904189575ac1b4cf199845497b9c23",
+        "size_bytes": 3054894144,
+        "tensor_keys": 795
+      }
+    ],
+    "auto_map_present": true,
+    "engine_checkpoint": {
+      "architecture": "RWKV7ForCausalLM",
+      "filename": "rwkv7-g1d-0.1b-hf/model.safetensors",
+      "model_type": "rwkv7_hf_adapter",
+      "normalized_key_templates": 39,
+      "sha256": "12d208adf2880927615656c2dc3f6fb6a3ea3120a9ed9fdfeeea55c841723d79",
+      "size_bytes": 382110672,
+      "tensor_keys": 399
+    },
+    "fixed_revision_claimed": false,
+    "provenance": "existing_local_hugging_face_checkpoint",
+    "remote_code_files_transferred": false,
+    "trust_remote_code": false,
+    "weights_committed": false
+  },
+  "end_to_end_generation_validated": true,
+  "environments": [
+    {
+      "alias": "gpu4080",
+      "compute_capability": [
+        8,
+        9
+      ],
+      "cuda": "13.2",
+      "default_0_75_engine_previously_passed": true,
+      "driver": "595.71.05",
+      "engine_gpu_memory_utilization": 0.15,
+      "gpu": "NVIDIA GeForce RTX 4080",
+      "gpu_count": 1,
+      "gpu_memory_mib": 16376,
+      "os": "Ubuntu 24.04.4 LTS",
+      "python": "3.12.3",
+      "torch": "2.13.0+cu132",
+      "vllm": "0.26.1rc1.dev146+g837eae645.d20260731"
+    },
+    {
+      "alias": "WZU_Server",
+      "compute_capability": [
+        7,
+        0
+      ],
+      "cuda": "12.6",
+      "driver": "580.173.02",
+      "engine_gpu_memory_utilization": 0.05,
+      "gpu": "Tesla V100-PCIE-32GB",
+      "gpu_count": 2,
+      "gpu_memory_mib": 32768,
+      "os": "Ubuntu 22.04.5 LTS",
+      "python": "3.10.12",
+      "torch": "2.13.0+cu126",
+      "vllm": "0.26.1rc1.dev146+g837eae645.d20260731",
+      "vllm_precompiled_cuda": "13.0"
+    }
+  ],
+  "observed_results": {
+    "checkpoint_load": "passed_on_both",
+    "chunked_prefill": "passed_on_both",
+    "dynamic_batch_state_reorder": "passed_on_both",
+    "eager_tp1_generation": "passed_on_both",
+    "local_config_without_remote_code": "passed_on_both",
+    "optional_fla_backend": "not_installed_and_not_claimed",
+    "plugin_discovery_and_model_registration": "passed_on_both",
+    "prefix_cache": {
+      "cache_mode": "align",
+      "cold_generation_equal_to_cached_generation": true,
+      "minimum_observed_contract": "num_cached_tokens >= 16",
+      "reset_cold_num_cached_tokens": 0,
+      "status": "passed_on_both"
+    },
+    "recurrent_cache_binding": "passed_on_both",
+    "released_slot_reuse": "passed_on_both",
+    "weight_key_mapping": "passed_on_both"
+  },
+  "performance_claim": false,
+  "recorded_date": "2026-07-31",
+  "remaining_gates": [
+    "optional FLA correctness on the RTX 4080 and V100 environments",
+    "compiled execution and CUDA graph support",
+    "tensor or pipeline parallel execution",
+    "long-running scheduler allocation and release soak",
+    "0.4B and 1.5B end-to-end engine runs"
+  ],
+  "schema_version": 1,
+  "scope": "real_vllm_plugin_cache_and_engine_correctness",
+  "test_suites": {
+    "WZU_Server": {
+      "failed": 0,
+      "passed": 76,
+      "skipped": 4
+    },
+    "gpu4080": {
+      "failed": 0,
+      "passed": 76,
+      "skipped": 4
+    }
+  },
+  "upstream": {
+    "precompiled_binary_commit": "553fcb82d5602c75fb6ab41b6dc3c46f480c1785",
+    "python_source_commit": "837eae64580c885101ee95b073aafb27a485e7ce",
+    "version": "0.26.1rc1.dev146+g837eae645.d20260731"
+  }
+}

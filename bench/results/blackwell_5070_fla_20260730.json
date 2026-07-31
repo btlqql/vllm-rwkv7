@@ -1,0 +1,151 @@
+{
+  "correctness_thresholds": {
+    "output_min_cosine": 0.9999,
+    "state_max_abs_diff": 0.02
+  },
+  "end_to_end_vllm_claim": false,
+  "environment": {
+    "compute_capability": [
+      12,
+      0
+    ],
+    "driver": "582.05",
+    "fla": "0.5.1",
+    "gpu": "NVIDIA GeForce RTX 5070 Laptop GPU",
+    "gpu_memory_mib": 8151,
+    "platform": "Windows-11-10.0.26200-SP0",
+    "python": "3.12.4",
+    "recorded_at": "2026-07-30T15:47:23.080722+00:00",
+    "torch": "2.11.0+cu128",
+    "torch_cuda": "12.8",
+    "triton": "3.7.1"
+  },
+  "rows": [
+    {
+      "axis": "rwkv7_recurrence_operator",
+      "batch_size": 1,
+      "dtype": "float16",
+      "fla_chunk_size": 32,
+      "fla_ms": 0.2046207904815674,
+      "fla_path": "fused_mul_recurrent",
+      "fla_prefill_min_tokens": 64,
+      "fla_tokens_per_second": 4887.088929949578,
+      "head_dim": 64,
+      "num_attention_heads": 16,
+      "operator_speedup": 2.5673403462753734,
+      "output": {
+        "max_abs_diff": 0.015625,
+        "mean_abs_diff": 0.00011946307495236397,
+        "min_cosine": 1.0
+      },
+      "passed": true,
+      "reference_ms": 0.5253312110900878,
+      "sequence_length": 1,
+      "state": {
+        "max_abs_diff": 0.0004082322120666504,
+        "mean_abs_diff": 1.1354132766427938e-05,
+        "min_cosine": 1.0000001192092896
+      },
+      "state_dtype": "float32"
+    },
+    {
+      "axis": "rwkv7_recurrence_operator",
+      "batch_size": 1,
+      "dtype": "float16",
+      "fla_chunk_size": 32,
+      "fla_ms": 0.5093440055847168,
+      "fla_path": "chunk",
+      "fla_prefill_min_tokens": 64,
+      "fla_tokens_per_second": 125651.81743236433,
+      "head_dim": 64,
+      "num_attention_heads": 16,
+      "operator_speedup": 34.60934205527613,
+      "output": {
+        "max_abs_diff": 0.09375,
+        "mean_abs_diff": 0.006142920348793268,
+        "min_cosine": 0.9999998807907104
+      },
+      "passed": true,
+      "reference_ms": 17.62806091308594,
+      "sequence_length": 64,
+      "state": {
+        "max_abs_diff": 0.004086971282958984,
+        "mean_abs_diff": 0.00034935565781779587,
+        "min_cosine": 0.9999999403953552
+      },
+      "state_dtype": "float32"
+    },
+    {
+      "axis": "rwkv7_recurrence_operator",
+      "batch_size": 1,
+      "dtype": "float16",
+      "fla_chunk_size": 32,
+      "fla_ms": 0.5324736118316651,
+      "fla_path": "chunk",
+      "fla_prefill_min_tokens": 64,
+      "fla_tokens_per_second": 961549.997264207,
+      "head_dim": 64,
+      "num_attention_heads": 16,
+      "operator_speedup": 281.00481526413023,
+      "output": {
+        "max_abs_diff": 0.125,
+        "mean_abs_diff": 0.006277834065258503,
+        "min_cosine": 0.9999998211860657
+      },
+      "passed": true,
+      "reference_ms": 149.62764892578124,
+      "sequence_length": 512,
+      "state": {
+        "max_abs_diff": 0.004025936126708984,
+        "mean_abs_diff": 0.0003469886723905802,
+        "min_cosine": 0.9999998807907104
+      },
+      "state_dtype": "float32"
+    },
+    {
+      "attention_hidden_size": 8,
+      "axis": "rwkv7_complete_layer_correctness",
+      "batch_size": 1,
+      "dtype": "float16",
+      "fla_path": "fused_mul_recurrent",
+      "hidden_size": 16,
+      "output": {
+        "max_abs_diff": 0.0,
+        "mean_abs_diff": 0.0,
+        "min_cosine": 1.0
+      },
+      "passed": true,
+      "sequence_length": 1,
+      "state": {
+        "max_abs_diff": 1.1920928955078125e-07,
+        "mean_abs_diff": 5.617039278149605e-09,
+        "min_cosine": 1.0
+      },
+      "state_dtype": "float32"
+    },
+    {
+      "attention_hidden_size": 8,
+      "axis": "rwkv7_complete_layer_correctness",
+      "batch_size": 1,
+      "dtype": "float16",
+      "fla_path": "chunk",
+      "hidden_size": 16,
+      "output": {
+        "max_abs_diff": 0.001953125,
+        "mean_abs_diff": 9.235739707946777e-05,
+        "min_cosine": 0.9999999403953552
+      },
+      "passed": true,
+      "sequence_length": 64,
+      "state": {
+        "max_abs_diff": 0.000386655330657959,
+        "mean_abs_diff": 0.00012371872435323894,
+        "min_cosine": 1.0
+      },
+      "state_dtype": "float32"
+    }
+  ],
+  "schema_version": 1,
+  "scope": "operator_correctness_and_microbenchmark_only",
+  "vllm_interface_baseline": "837eae64580c885101ee95b073aafb27a485e7ce"
+}

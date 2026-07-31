@@ -1,0 +1,15 @@
+vllm-rwkv7
+Copyright 2026 btlqql
+
+This repository contains an independently written vLLM integration.
+
+Algorithm and API references:
+
+- RWKV-7 public recurrence specification:
+  https://github.com/BlinkDL/RWKV-LM/blob/main/RWKV-v7/rwkv_v7_numpy.py
+- vLLM public out-of-tree plugin interface:
+  https://docs.vllm.ai/en/latest/design/plugin_system.html
+- Optional FLA RWKV-7 operator API:
+  https://github.com/fla-org/flash-linear-attention/tree/main/fla/ops/rwkv7
+
+No source files from earlier third-party vLLM RWKV-7 pull requests are included.
