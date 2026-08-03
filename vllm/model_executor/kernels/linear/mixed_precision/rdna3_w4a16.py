@@ -53,6 +53,13 @@ class RDNA3W4A16LinearKernel(MPLinearKernel):
                 "torch.ops._rocm_C.gptq_gemm_rdna3 missing — rebuild C++ extension",
             )
 
+        if torch.are_deterministic_algorithms_enabled():
+            return (
+                False,
+                "RDNA3 W4A16 uses unordered atomic accumulation; use the "
+                "deterministic RDNA hybrid fallback",
+            )
+
         if c.act_type not in (torch.float16, torch.bfloat16):
             return False, "RDNA3 W4A16 kernel only supports fp16 and bf16"
 

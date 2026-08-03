@@ -147,14 +147,20 @@ kept the same short greedy token sequence but produced distinct generated-token
 log probabilities, which avoids treating an unchanged argmax as a false LoRA
 failure.
 
-The quantization result remains a compatibility result, not a production-speed
-claim. Full online INT8 with the Triton recurrent backend reduced model memory
-from 2.85 to 1.78 GiB, but reached only 0.856x the 16-bit throughput and 0.656
-token agreement. BitsAndBytes NF4 loaded and generated on `gfx1100`, reducing
-model memory to 1.50 GiB, but its three-repeat batch-eight confirmation reached
-only 0.713x 16-bit throughput and 0.547 token agreement. TorchAO INT4 is
-unsupported on this RDNA3 device because its packing operator requires CDNA2
-or newer.
+The initial generic quantization result remained a compatibility result. Full
+online INT8 reduced model memory from 2.85 to 1.78 GiB but reached only 0.856x
+the 16-bit throughput. BitsAndBytes NF4 reduced model memory to 1.50 GiB but
+reached only 0.713x. TorchAO INT4 is unsupported on this RDNA3 device because
+its packing operator requires CDNA2 or newer.
+
+A follow-up added native compressed-tensors W8 and qualified a deterministic
+W4 policy. At batch eight, prompt 128, and decode 64, the selected W8 policy
+reached 1.120x FP16 throughput with 24.21% lower model memory; the selected W4
+policy reached 1.064x with 17.54% lower model memory. Both pass fixed-prompt
+log-probability and perplexity gates. These are exact `gfx1100`/1.5B policy
+claims rather than a global AMD default. Conversion policy, commands, rejected
+experiments, and quality evidence are documented in
+`2026-08-03-rwkv7-rocm-quantization.md`.
 
 The benchmark entrypoints now record the HIP runtime and accept an explicit
 RWKV-7 recurrent backend. This allows ROCm quantization and LoRA runs to test
@@ -162,8 +168,9 @@ the fused recurrent path without changing the conservative global `auto`
 policy. The machine-readable ROCm rows are stored in
 `benchmarks/results/rwkv7_amd_20260803.jsonl`.
 
-All engine evidence above uses eager execution. The compile/CUDAGraph path is
-not claimed from this host: its older precompiled core extension was missing a
-current-source operator, while the installed PyTorch 2.9 headers could not
-build the current stable-ABI core extension. This is an environment limitation,
-not a substituted eager result.
+The extension and runtime were subsequently aligned with the current source.
+The non-eager Torch-compile/CUDAGraph row at batch eight, prompt 128, and decode
+8 preserved all eight continuations and improved Triton throughput from 32.14
+to 148.46 output tokens/s (4.619x). The qualified compressed-tensors W8/W4 rows
+also use non-eager execution. Earlier eager evidence remains valid and is not
+substituted for these compile-path runs.

@@ -1,17 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Benchmark RWKV7 16-bit, online INT8, TorchAO INT8/INT4, and BitsAndBytes.
+"""Benchmark RWKV7 16-bit and weight-only quantization implementations.
 
 Every setting runs in a fresh process.  Besides median output throughput, the
 report extracts vLLM's model-resident GPU-memory measurement and compares
 greedy tokens with the 16-bit run.  The setting name ``fp16`` is retained for
 CLI compatibility, while ``--dtype`` selects FP16 or BF16.  The default gates
 encode the production target: model memory must decrease, throughput must not
-regress, and generated tokens must match the reference.
+regress, and generated tokens must match the reference. An explicit fixed-prompt
+log-probability gate can qualify policies whose continuations diverge.
 """
 
 import argparse
 import json
+import math
 import statistics
 import subprocess
 import sys
@@ -45,6 +47,8 @@ EXCEPTION_SUMMARY_PATTERN = re.compile(
 )
 SETTINGS = (
     "fp16",
+    "ct-w8",
+    "ct-w4",
     "online-int8",
     "torchao-int8",
     "torchao-int4",
@@ -57,6 +61,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True, help="16-bit reference checkpoint")
     parser.add_argument("--tokenizer")
+    parser.add_argument(
+        "--ct-w8-model", help="Compressed-tensors pack-quantized W8A16 model"
+    )
+    parser.add_argument(
+        "--ct-w4-model", help="Compressed-tensors pack-quantized W4A16 model"
+    )
     parser.add_argument("--int8-model", help="Pre-quantized BitsAndBytes INT8 model")
     parser.add_argument(
         "--int4-model",
@@ -71,6 +81,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prompt", action="append", default=[])
     parser.add_argument("--prompts-file", type=Path)
     parser.add_argument(
+        "--prompt-token-ids-file",
+        type=Path,
+        help="JSON array of token-ID arrays for tokenizer-independent evaluation.",
+    )
+    parser.add_argument(
         "--prompt-token-length",
         action="append",
         type=int,
@@ -79,6 +94,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--max-tokens", type=int, default=64)
     parser.add_argument("--logprobs", type=int, default=1)
+    parser.add_argument("--prompt-logprobs", type=int, default=1)
     parser.add_argument(
         "--warmup-runs",
         type=int,
@@ -106,6 +122,15 @@ def parse_args() -> argparse.Namespace:
         "--require-repeatable", action=argparse.BooleanOptionalAction, default=True
     )
     parser.add_argument(
+        "--repeat-logprob-margin-tolerance",
+        type=float,
+        default=0.0,
+        help=(
+            "Allow a repeated greedy-token flip only when both runs place the "
+            "two competing tokens within this log-probability margin."
+        ),
+    )
+    parser.add_argument(
         "--record-unsupported",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -114,6 +139,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-speed-ratio", type=float, default=1.0)
     parser.add_argument("--min-memory-reduction", type=float, default=0.01)
     parser.add_argument("--min-token-agreement", type=float, default=1.0)
+    parser.add_argument("--max-prompt-logprob-mean-abs-error", type=float)
+    parser.add_argument("--max-prompt-perplexity-ratio", type=float)
     parser.add_argument(
         "--online-int8-target-regex",
         help=(
@@ -153,7 +180,11 @@ def load_prompts(args: argparse.Namespace) -> list[Any]:
     if args.warmup_runs < 0 or args.repeats < 1:
         raise ValueError("--warmup-runs must be >= 0 and --repeats must be >= 1")
     if args.prompt_token_length:
-        if args.prompt or args.prompts_file is not None:
+        if (
+            args.prompt
+            or args.prompts_file is not None
+            or args.prompt_token_ids_file is not None
+        ):
             raise ValueError(
                 "--prompt-token-length cannot be combined with text prompts"
             )
@@ -168,6 +199,29 @@ def load_prompts(args: argparse.Namespace) -> list[Any]:
             }
             for request_index, length in enumerate(args.prompt_token_length)
         ]
+    if args.prompt_token_ids_file is not None:
+        if args.prompt or args.prompts_file is not None:
+            raise ValueError(
+                "--prompt-token-ids-file cannot be combined with text prompts"
+            )
+        loaded = json.loads(args.prompt_token_ids_file.read_text())
+        if not (
+            isinstance(loaded, list)
+            and loaded
+            and all(
+                isinstance(prompt, list)
+                and prompt
+                and all(
+                    isinstance(token_id, int) and token_id >= 0 for token_id in prompt
+                )
+                for prompt in loaded
+            )
+        ):
+            raise ValueError(
+                "--prompt-token-ids-file must contain a non-empty JSON array "
+                "of non-empty, non-negative integer arrays"
+            )
+        return [{"prompt_token_ids": prompt} for prompt in loaded]
     prompts = list(args.prompt)
     if args.prompts_file is not None:
         loaded = json.loads(args.prompts_file.read_text())
@@ -175,6 +229,14 @@ def load_prompts(args: argparse.Namespace) -> list[Any]:
             raise ValueError("--prompts-file must contain a JSON array of strings")
         prompts.extend(loaded)
     return prompts or DEFAULT_PROMPTS
+
+
+def repeat_mismatch_is_tied(mismatch: dict[str, Any], margin_tolerance: float) -> bool:
+    margins = (mismatch.get("reference_margin"), mismatch.get("candidate_margin"))
+    return margin_tolerance > 0 and all(
+        isinstance(margin, (int, float)) and 0 <= margin <= margin_tolerance
+        for margin in margins
+    )
 
 
 def run_worker(args: argparse.Namespace) -> None:
@@ -188,6 +250,13 @@ def run_worker(args: argparse.Namespace) -> None:
     os.environ["VLLM_RWKV7_KERNEL"] = args.rwkv7_backend
     if args.require_repeatable:
         os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    if args.require_repeatable and args.worker_setting == "ct-w4":
+        disabled_kernels = list(
+            filter(None, os.environ.get("VLLM_DISABLED_KERNELS", "").split(","))
+        )
+        if "RDNA3W4A16LinearKernel" not in disabled_kernels:
+            disabled_kernels.append("RDNA3W4A16LinearKernel")
+        os.environ["VLLM_DISABLED_KERNELS"] = ",".join(disabled_kernels)
     # Keep the benchmark self-contained on CUDA hosts without a full nvcc
     # toolchain; sampling is outside the measured model/kernel scope.
     os.environ.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
@@ -261,7 +330,8 @@ def run_worker(args: argparse.Namespace) -> None:
         )
 
     load_started = time.perf_counter()
-    if args.prompt_token_length:
+    uses_token_ids = bool(args.prompt_token_length or args.prompt_token_ids_file)
+    if uses_token_ids:
         llm_kwargs["skip_tokenizer_init"] = True
     llm = LLM(
         model=args.worker_model,
@@ -274,7 +344,7 @@ def run_worker(args: argparse.Namespace) -> None:
         max_model_len=args.max_model_len,
         gpu_memory_utilization=args.gpu_memory_utilization,
         disable_log_stats=False,
-        tokenizer=(None if args.prompt_token_length else args.tokenizer or args.model),
+        tokenizer=(None if uses_token_ids else args.tokenizer or args.model),
         **llm_kwargs,
     )
     load_s = time.perf_counter() - load_started
@@ -283,6 +353,7 @@ def run_worker(args: argparse.Namespace) -> None:
         temperature=0,
         max_tokens=args.max_tokens,
         logprobs=args.logprobs,
+        prompt_logprobs=args.prompt_logprobs,
         ignore_eos=args.ignore_eos,
     )
     for _ in range(args.warmup_runs):
@@ -290,17 +361,22 @@ def run_worker(args: argparse.Namespace) -> None:
 
     samples = []
     signatures = []
+    outputs_by_run = []
     outputs = None
     for _ in range(args.repeats):
         started = time.perf_counter()
         outputs = llm.generate(prompts, sampling_params, use_tqdm=False)
         samples.append(time.perf_counter() - started)
+        outputs_by_run.append(outputs)
         signatures.append([tuple(item.outputs[0].token_ids) for item in outputs])
     assert outputs is not None
     repeat_mismatch = None
+    tolerated_repeat_mismatches = []
+    exact_repeatable = all(signature == signatures[0] for signature in signatures[1:])
     for run_index, signature in enumerate(signatures[1:], start=1):
         if signature == signatures[0]:
             continue
+        mismatch = None
         for request_index, (reference_ids, candidate_ids) in enumerate(
             zip(signatures[0], signature)
         ):
@@ -315,14 +391,55 @@ def run_worker(args: argparse.Namespace) -> None:
                 ),
                 common,
             )
-            repeat_mismatch = {
+            mismatch = {
                 "run": run_index,
                 "request": request_index,
                 "token": token_index,
             }
+            if token_index < common:
+                reference_token = reference_ids[token_index]
+                candidate_token = candidate_ids[token_index]
+                reference_logprobs = (
+                    outputs_by_run[0][request_index].outputs[0].logprobs or []
+                )
+                candidate_logprobs = (
+                    outputs_by_run[run_index][request_index].outputs[0].logprobs or []
+                )
+                reference_step = (
+                    reference_logprobs[token_index]
+                    if token_index < len(reference_logprobs)
+                    else {}
+                )
+                candidate_step = (
+                    candidate_logprobs[token_index]
+                    if token_index < len(candidate_logprobs)
+                    else {}
+                )
+
+                def margin(step_logprobs, selected_token, competing_token):
+                    selected = step_logprobs.get(selected_token)
+                    competing = step_logprobs.get(competing_token)
+                    if selected is None or competing is None:
+                        return None
+                    return float(selected.logprob - competing.logprob)
+
+                mismatch.update(
+                    reference_token=reference_token,
+                    candidate_token=candidate_token,
+                    reference_margin=margin(
+                        reference_step, reference_token, candidate_token
+                    ),
+                    candidate_margin=margin(
+                        candidate_step, candidate_token, reference_token
+                    ),
+                )
             break
-        if repeat_mismatch is None:
-            repeat_mismatch = {"run": run_index, "request": None, "token": None}
+        if mismatch is None:
+            mismatch = {"run": run_index, "request": None, "token": None}
+        if repeat_mismatch_is_tied(mismatch, args.repeat_logprob_margin_tolerance):
+            tolerated_repeat_mismatches.append(mismatch)
+            continue
+        repeat_mismatch = mismatch
         break
     if repeat_mismatch is not None and args.require_repeatable:
         raise RuntimeError(
@@ -342,6 +459,7 @@ def run_worker(args: argparse.Namespace) -> None:
     output_tokens = sum(len(item.outputs[0].token_ids) for item in outputs)
     request_metrics = []
     generated_token_logprobs = []
+    prompt_token_logprobs = []
     for item in outputs:
         metrics = item.metrics
         arrival_time = getattr(metrics, "arrival_time", None)
@@ -379,6 +497,15 @@ def run_worker(args: argparse.Namespace) -> None:
                 None if token_entry is None else float(token_entry.logprob)
             )
         generated_token_logprobs.append(token_logprobs)
+        prompt_logprobs = []
+        for token_id, step_logprobs in zip(
+            item.prompt_token_ids, item.prompt_logprobs or []
+        ):
+            token_entry = None if step_logprobs is None else step_logprobs.get(token_id)
+            prompt_logprobs.append(
+                None if token_entry is None else float(token_entry.logprob)
+            )
+        prompt_token_logprobs.append(prompt_logprobs)
     result = {
         "setting": args.worker_setting,
         "dtype": args.dtype,
@@ -401,8 +528,11 @@ def run_worker(args: argparse.Namespace) -> None:
         },
         "request_metrics": request_metrics,
         "generated_token_logprobs": generated_token_logprobs,
+        "prompt_token_logprobs": prompt_token_logprobs,
         "repeatable": repeat_mismatch is None,
+        "exact_repeatable": exact_repeatable,
         "repeat_mismatch": repeat_mismatch,
+        "tolerated_repeat_mismatches": tolerated_repeat_mismatches,
         "rwkv7_backend": args.rwkv7_backend,
         "online_int8_target_regex": args.online_int8_target_regex,
         "requests": [list(item.outputs[0].token_ids) for item in outputs],
@@ -413,6 +543,14 @@ def run_worker(args: argparse.Namespace) -> None:
 def _setting_model(args: argparse.Namespace, setting: str) -> tuple[str, bool]:
     if setting == "fp16":
         return args.model, False
+    if setting == "ct-w8":
+        if args.ct_w8_model is None:
+            raise ValueError("--ct-w8-model is required for ct-w8")
+        return args.ct_w8_model, False
+    if setting == "ct-w4":
+        if args.ct_w4_model is None:
+            raise ValueError("--ct-w4-model is required for ct-w4")
+        return args.ct_w4_model, False
     if setting == "online-int8" or setting.startswith("torchao-"):
         return args.model, False
     if setting == "bnb-int8":
@@ -453,8 +591,10 @@ def run_setting(args: argparse.Namespace, setting: str) -> dict[str, Any]:
     for name in (
         "max_tokens",
         "logprobs",
+        "prompt_logprobs",
         "warmup_runs",
         "repeats",
+        "repeat_logprob_margin_tolerance",
         "dtype",
         "max_model_len",
         "max_num_batched_tokens",
@@ -469,6 +609,8 @@ def run_setting(args: argparse.Namespace, setting: str) -> dict[str, Any]:
         command.extend(["--prompt-token-length", str(prompt_token_length)])
     if args.prompts_file is not None:
         command.extend(["--prompts-file", str(args.prompts_file)])
+    if args.prompt_token_ids_file is not None:
+        command.extend(["--prompt-token-ids-file", str(args.prompt_token_ids_file)])
     if args.online_int8_target_regex is not None:
         command.extend(["--online-int8-target-regex", args.online_int8_target_regex])
     command.extend(["--rwkv7-backend", args.rwkv7_backend])
@@ -548,6 +690,9 @@ def compare_with_reference(
     exact_requests = 0
     request_reports = []
     logprob_errors = []
+    prompt_logprob_errors = []
+    reference_prompt_nlls = []
+    candidate_prompt_nlls = []
     for index, (ref_ids, candidate_ids) in enumerate(
         zip(reference["requests"], candidate["requests"])
     ):
@@ -583,6 +728,16 @@ def compare_with_reference(
                 "candidate_length": len(candidate_ids),
             }
         )
+        reference_prompt_logprobs = reference["prompt_token_logprobs"][index]
+        candidate_prompt_logprobs = candidate["prompt_token_logprobs"][index]
+        for ref_logprob, candidate_logprob in zip(
+            reference_prompt_logprobs, candidate_prompt_logprobs
+        ):
+            if ref_logprob is None or candidate_logprob is None:
+                continue
+            prompt_logprob_errors.append(abs(candidate_logprob - ref_logprob))
+            reference_prompt_nlls.append(-ref_logprob)
+            candidate_prompt_nlls.append(-candidate_logprob)
 
     memory_reduction = None
     if (
@@ -602,6 +757,20 @@ def compare_with_reference(
         ),
         "generated_token_logprob_mean_abs_error": (
             statistics.mean(logprob_errors) if logprob_errors else None
+        ),
+        "prompt_logprob_max_abs_error": (
+            max(prompt_logprob_errors) if prompt_logprob_errors else None
+        ),
+        "prompt_logprob_mean_abs_error": (
+            statistics.mean(prompt_logprob_errors) if prompt_logprob_errors else None
+        ),
+        "prompt_perplexity_ratio": (
+            math.exp(
+                statistics.mean(candidate_prompt_nlls)
+                - statistics.mean(reference_prompt_nlls)
+            )
+            if reference_prompt_nlls
+            else None
         ),
         "exact_requests": exact_requests,
         "total_requests": len(request_reports),
@@ -629,7 +798,9 @@ def compact_result(result: dict[str, Any]) -> dict[str, Any]:
         "elapsed_s",
         "samples_s",
         "repeatable",
+        "exact_repeatable",
         "repeat_mismatch",
+        "tolerated_repeat_mismatches",
         "rwkv7_backend",
         "online_int8_target_regex",
         "engine_memory",
@@ -644,6 +815,18 @@ def main() -> None:
         return
     if not 0.0 <= args.min_token_agreement <= 1.0:
         raise ValueError("--min-token-agreement must be between 0 and 1")
+    if args.repeat_logprob_margin_tolerance < 0:
+        raise ValueError("--repeat-logprob-margin-tolerance must be non-negative")
+    if (
+        args.max_prompt_logprob_mean_abs_error is not None
+        and args.max_prompt_logprob_mean_abs_error < 0
+    ):
+        raise ValueError("--max-prompt-logprob-mean-abs-error must be non-negative")
+    if (
+        args.max_prompt_perplexity_ratio is not None
+        and args.max_prompt_perplexity_ratio <= 0
+    ):
+        raise ValueError("--max-prompt-perplexity-ratio must be positive")
     if "fp16" not in args.settings:
         raise ValueError("--settings must include fp16 as the reference")
 
@@ -674,6 +857,22 @@ def main() -> None:
                 f"{comparison['setting']} "
                 f"token_agreement={comparison['token_agreement']:.4f}"
             )
+        prompt_error = comparison["prompt_logprob_mean_abs_error"]
+        if args.max_prompt_logprob_mean_abs_error is not None and (
+            prompt_error is None
+            or prompt_error > args.max_prompt_logprob_mean_abs_error
+        ):
+            failed.append(
+                f"{comparison['setting']} prompt_logprob_mean_abs_error={prompt_error}"
+            )
+        perplexity_ratio = comparison["prompt_perplexity_ratio"]
+        if args.max_prompt_perplexity_ratio is not None and (
+            perplexity_ratio is None
+            or perplexity_ratio > args.max_prompt_perplexity_ratio
+        ):
+            failed.append(
+                f"{comparison['setting']} prompt_perplexity_ratio={perplexity_ratio}"
+            )
 
     if args.jsonl_out is not None:
         args.jsonl_out.parent.mkdir(parents=True, exist_ok=True)
@@ -696,16 +895,37 @@ def main() -> None:
                 "dtype": args.dtype,
                 "settings": args.settings,
                 "max_tokens": args.max_tokens,
+                "logprobs": args.logprobs,
+                "prompt_logprobs": args.prompt_logprobs,
                 "max_model_len": args.max_model_len,
                 "max_num_batched_tokens": args.max_num_batched_tokens,
+                "gpu_memory_utilization": args.gpu_memory_utilization,
                 "warmup_runs": args.warmup_runs,
                 "repeats": args.repeats,
+                "repeat_logprob_margin_tolerance": (
+                    args.repeat_logprob_margin_tolerance
+                ),
+                "require_repeatable": args.require_repeatable,
+                "require_gates": args.require_gates,
                 "prompt_count": len(load_prompts(args)),
+                "prompt_token_ids_file": (
+                    None
+                    if args.prompt_token_ids_file is None
+                    else str(args.prompt_token_ids_file)
+                ),
                 "enforce_eager": args.enforce_eager,
                 "async_scheduling": args.async_scheduling,
+                "ignore_eos": args.ignore_eos,
                 "enable_chunked_prefill": True,
                 "rwkv7_backend": args.rwkv7_backend,
                 "online_int8_target_regex": args.online_int8_target_regex,
+                "min_speed_ratio": args.min_speed_ratio,
+                "min_memory_reduction": args.min_memory_reduction,
+                "min_token_agreement": args.min_token_agreement,
+                "max_prompt_logprob_mean_abs_error": (
+                    args.max_prompt_logprob_mean_abs_error
+                ),
+                "max_prompt_perplexity_ratio": args.max_prompt_perplexity_ratio,
             },
             "results": {
                 setting: compact_result(result) for setting, result in results.items()
