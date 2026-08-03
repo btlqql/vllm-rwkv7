@@ -29,6 +29,9 @@ from vllm.model_executor.kernels.linear.mixed_precision.MPLinearKernel import ( 
 from vllm.model_executor.kernels.linear.mixed_precision.rdna3_w4a16 import (  # noqa: E402
     RDNA3W4A16LinearKernel,
 )
+from vllm.model_executor.kernels.linear.mixed_precision.rdna_hybrid_w4a16 import (  # noqa: E402
+    RDNAHybridW4A16LinearKernel,
+)
 from vllm.platforms.rocm import on_gfx1100  # noqa: E402
 from vllm.scalar_type import scalar_types  # noqa: E402
 
@@ -60,6 +63,38 @@ def test_selection_prefers_rdna3(dtype):
         has_g_idx=False,
     )
     assert choose_mp_linear_kernel(config).__name__ == "RDNA3W4A16LinearKernel"
+
+
+@gfx1100_only
+def test_selection_uses_hybrid_when_deterministic_algorithms_are_enabled(monkeypatch):
+    config = MPLinearLayerConfig(
+        full_weight_shape=(1024, 256),
+        partition_weight_shape=(1024, 256),
+        weight_type=WEIGHT_TYPE,
+        act_type=torch.float16,
+        group_size=32,
+        zero_points=False,
+        has_g_idx=False,
+    )
+    monkeypatch.setattr(torch, "are_deterministic_algorithms_enabled", lambda: True)
+
+    assert choose_mp_linear_kernel(config) is RDNAHybridW4A16LinearKernel
+
+
+@gfx1100_only
+def test_selection_uses_hybrid_when_rdna3_is_disabled(monkeypatch):
+    config = MPLinearLayerConfig(
+        full_weight_shape=(1024, 256),
+        partition_weight_shape=(1024, 256),
+        weight_type=WEIGHT_TYPE,
+        act_type=torch.float16,
+        group_size=32,
+        zero_points=False,
+        has_g_idx=False,
+    )
+    monkeypatch.setenv("VLLM_DISABLED_KERNELS", "RDNA3W4A16LinearKernel")
+
+    assert choose_mp_linear_kernel(config) is RDNAHybridW4A16LinearKernel
 
 
 @gfx1100_only

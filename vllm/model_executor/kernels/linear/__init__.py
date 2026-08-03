@@ -60,6 +60,9 @@ from vllm.model_executor.kernels.linear.mixed_precision.rdna3_w4a16 import (
 from vllm.model_executor.kernels.linear.mixed_precision.rdna_hybrid_w4a16 import (
     RDNAHybridW4A16LinearKernel,
 )
+from vllm.model_executor.kernels.linear.mixed_precision.rdna_w8a16 import (
+    RDNAW8A16LinearKernel,
+)
 from vllm.model_executor.kernels.linear.mixed_precision.triton_w4a16 import (
     TritonW4A16LinearKernel,
 )
@@ -263,6 +266,7 @@ _LINEAR_BACKEND_KERNEL_MAP: dict[str, set[type]] = {
         TritonInt8ScaledMMLinearKernel,
         TritonFp8BlockScaledMMKernel,
         TritonW4A16LinearKernel,
+        RDNAW8A16LinearKernel,
     },
     "deep_gemm": {
         DeepGemmFp8BlockScaledMMKernel,
@@ -411,6 +415,7 @@ _POSSIBLE_KERNELS: dict[PlatformEnum, list[type[MPLinearKernel]]] = {
     PlatformEnum.ROCM: [
         RDNA3W4A16LinearKernel,
         RDNAHybridW4A16LinearKernel,
+        RDNAW8A16LinearKernel,
         TritonW4A16LinearKernel,
         ConchLinearKernel,
         ExllamaLinearKernel,
