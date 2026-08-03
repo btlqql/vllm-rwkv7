@@ -212,6 +212,8 @@ def rocm_unquantized_gemm(
     weight: torch.Tensor,
     bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    if not x.is_cuda:
+        return default_unquantized_gemm(layer, x, weight, bias)
     return torch.ops.vllm.rocm_unquantized_gemm(x, weight, bias)
 
 

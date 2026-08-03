@@ -119,3 +119,51 @@ tensor-parallel, and pipeline-parallel rows remain valid. A fresh V100
 prefix/LoRA rerun was not forced while both shared cards were occupied; no
 process was terminated and no new V100 capability claim is made from the RTX
 4080 evidence.
+
+### ROCm qualification
+
+The same native implementation was qualified on a 48 GiB `gfx1100` device
+with ROCm 7.2.1 and Triton 3.5.1. The current ROCm extension was built for
+`gfx1100`; its wave32 skinny-GEMM path and the RWKV-7 Triton recurrent kernels
+then passed the full focused matrix: 40 tests passed and two external-checkpoint
+tests skipped. This includes the packed-scan oracle, 512-token state continuity,
+custom-op parity, batched decode, and the ROCm skinny-GEMM tests. ROCm-hosted
+CPU model tests now bypass the GPU-only custom GEMM and use the normal Torch
+linear fallback.
+
+The real 1.5B checkpoint passed an exact batch-eight, prompt-128, decode-64
+Torch-versus-Triton engine comparison across three measured repeats. Triton
+produced the same continuation for all eight requests and improved median
+output throughput from 125.03 to 201.05 tokens/s, a 1.608x speedup. With Mamba
+prefix-cache mode `all`, both backends reused 112 tokens per request and
+preserved all eight continuations; the Triton row reached 105.01 tokens/s
+versus 75.32 tokens/s for Torch. A separate batch-eight asynchronous-scheduler
+smoke also preserved all eight Torch continuations while chunked prefill was
+enabled.
+
+Runtime LoRA rank-8 load, two-adapter switching, removal, and exact base-output
+restoration also passed with the Triton recurrent backend. The two adapters
+kept the same short greedy token sequence but produced distinct generated-token
+log probabilities, which avoids treating an unchanged argmax as a false LoRA
+failure.
+
+The quantization result remains a compatibility result, not a production-speed
+claim. Full online INT8 with the Triton recurrent backend reduced model memory
+from 2.85 to 1.78 GiB, but reached only 0.856x the 16-bit throughput and 0.656
+token agreement. BitsAndBytes NF4 loaded and generated on `gfx1100`, reducing
+model memory to 1.50 GiB, but its three-repeat batch-eight confirmation reached
+only 0.713x 16-bit throughput and 0.547 token agreement. TorchAO INT4 is
+unsupported on this RDNA3 device because its packing operator requires CDNA2
+or newer.
+
+The benchmark entrypoints now record the HIP runtime and accept an explicit
+RWKV-7 recurrent backend. This allows ROCm quantization and LoRA runs to test
+the fused recurrent path without changing the conservative global `auto`
+policy. The machine-readable ROCm rows are stored in
+`benchmarks/results/rwkv7_amd_20260803.jsonl`.
+
+All engine evidence above uses eager execution. The compile/CUDAGraph path is
+not claimed from this host: its older precompiled core extension was missing a
+current-source operator, while the installed PyTorch 2.9 headers could not
+build the current stable-ABI core extension. This is an environment limitation,
+not a substituted eager result.
