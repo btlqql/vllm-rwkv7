@@ -1054,7 +1054,7 @@ def test_rwkv7_hybrid_block_constructs_attention_and_ffn_state():
         a_low_rank_dim=16,
         v_low_rank_dim=16,
         value_dim=[64, 128],
-        attn={"layers": [1], "num_heads": 4, "num_kv_heads": 4},
+        attn={"layers": [1], "num_heads": 1, "num_kv_heads": 1},
     )
     vllm_config = VllmConfig(device_config=DeviceConfig("cpu"))
     with set_current_vllm_config(vllm_config):

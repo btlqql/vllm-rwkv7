@@ -292,6 +292,7 @@ def run_worker(args: argparse.Namespace) -> None:
         "software": {
             "torch": torch.__version__,
             "cuda": torch.version.cuda,
+            "hip": getattr(torch.version, "hip", None),
             "vllm": vllm.__version__,
         },
         "request_metrics": request_metrics,
@@ -450,6 +451,28 @@ def compare_results(
     }
 
 
+def compact_backend_result(result: dict[str, Any]) -> dict[str, Any]:
+    """Omit full token/logprob arrays already summarized by the comparison."""
+    keys = (
+        "backend",
+        "elapsed_s",
+        "samples_s",
+        "input_tokens",
+        "output_tokens",
+        "total_tokens",
+        "output_tok_s",
+        "total_tok_s",
+        "peak_allocated_bytes",
+        "peak_reserved_bytes",
+        "gpu",
+        "software",
+        "request_metrics",
+        "prefix_cache",
+        "engine_memory",
+    )
+    return {key: result[key] for key in keys if key in result}
+
+
 def main() -> None:
     args = parse_args()
     if args.worker is not None:
@@ -476,11 +499,14 @@ def main() -> None:
                 "repeats": args.repeats,
                 "candidate_backend": args.candidate_backend,
                 "prompt_count": len(load_prompts(args)),
+                "enforce_eager": args.enforce_eager,
+                "async_scheduling": args.async_scheduling,
+                "enable_chunked_prefill": True,
                 "prefix_cache": args.prefix_cache,
                 "mamba_cache_mode": args.mamba_cache_mode,
             },
-            "torch": torch_result,
-            "candidate": candidate_result,
+            "torch": compact_backend_result(torch_result),
+            "candidate": compact_backend_result(candidate_result),
             "comparison": comparison,
         }
         with args.jsonl_out.open("a", encoding="utf-8") as output_file:

@@ -20,6 +20,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-tokens", type=int, default=16)
     parser.add_argument("--max-model-len", type=int, default=2048)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.8)
+    parser.add_argument(
+        "--rwkv7-backend",
+        choices=("auto", "torch", "triton"),
+        default="torch",
+    )
     parser.add_argument("--jsonl-out", type=Path)
     parser.add_argument("--benchmark-tag", default="")
     return parser.parse_args()
@@ -65,18 +70,25 @@ def create_adapter(
     save_file(weights, output_dir / "adapter_model.safetensors")
 
 
-def token_signature(outputs) -> tuple[int, ...]:
-    return tuple(outputs[0].outputs[0].token_ids)
+def generation_signature(outputs) -> dict[str, tuple]:
+    generation = outputs[0].outputs[0]
+    token_ids = tuple(generation.token_ids)
+    token_logprobs = tuple(
+        float(step[token_id].logprob)
+        for token_id, step in zip(token_ids, generation.logprobs or [])
+    )
+    return {"token_ids": token_ids, "token_logprobs": token_logprobs}
 
 
 def timed_generate(llm, prompts, sampling, **kwargs):
     started = time.perf_counter()
     outputs = llm.generate(prompts, sampling, use_tqdm=False, **kwargs)
-    return token_signature(outputs), time.perf_counter() - started
+    return generation_signature(outputs), time.perf_counter() - started
 
 
 def main() -> None:
     args = parse_args()
+    os.environ["VLLM_RWKV7_KERNEL"] = args.rwkv7_backend
     os.environ.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
 
     from vllm import LLM, SamplingParams
@@ -103,6 +115,7 @@ def main() -> None:
     sampling = SamplingParams(
         temperature=0,
         max_tokens=args.max_tokens,
+        logprobs=1,
         ignore_eos=True,
     )
 
@@ -163,6 +176,10 @@ def main() -> None:
     import torch
 
     import vllm
+    from vllm.platforms import current_platform
+
+    device = torch.accelerator.current_device_index()
+    capability = current_platform.get_device_capability(device)
 
     report = {
         "schema": "rwkv7-lora-benchmark-v1",
@@ -171,17 +188,20 @@ def main() -> None:
         "model": args.model,
         "dtype": args.dtype,
         "gpu": {
-            "name": torch.cuda.get_device_name(),
-            "capability": list(torch.cuda.get_device_capability()),
-            "total_memory_bytes": torch.cuda.get_device_properties(0).total_memory,
+            "name": current_platform.get_device_name(device),
+            "capability": None if capability is None else list(capability),
+            "total_memory_bytes": current_platform.get_device_total_memory(device),
         },
         "software": {
             "torch": torch.__version__,
             "cuda": torch.version.cuda,
+            "hip": getattr(torch.version, "hip", None),
             "vllm": vllm.__version__,
         },
         "prompt_token_length": args.prompt_token_length,
         "max_tokens": args.max_tokens,
+        "enforce_eager": True,
+        "rwkv7_backend": args.rwkv7_backend,
         "rank": args.rank,
         "target_module": "model.layers.0.attn.r_proj",
         "base_restored": base_after == base_before,
@@ -191,9 +211,12 @@ def main() -> None:
         "adapters_distinct": output_one != output_two,
         "switch_stable": output_two_after_switch == output_two,
         "loaded_after_remove": sorted(llm.llm_engine.list_loras()),
-        "base_tokens": list(base_before),
-        "adapter_one_tokens": list(output_one),
-        "adapter_two_tokens": list(output_two),
+        "base_tokens": list(base_before["token_ids"]),
+        "adapter_one_tokens": list(output_one["token_ids"]),
+        "adapter_two_tokens": list(output_two["token_ids"]),
+        "base_token_logprobs": list(base_before["token_logprobs"]),
+        "adapter_one_token_logprobs": list(output_one["token_logprobs"]),
+        "adapter_two_token_logprobs": list(output_two["token_logprobs"]),
         "latency_s": {
             "base_before": base_before_s,
             "adapter_one": adapter_one_s,

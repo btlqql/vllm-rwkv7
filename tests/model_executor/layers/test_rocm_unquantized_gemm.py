@@ -17,6 +17,22 @@ if current_platform.is_cuda():
 from vllm.model_executor.layers import utils
 
 
+def test_rocm_unquantized_gemm_falls_back_for_cpu_tensors(monkeypatch):
+    x = torch.randn(2, 64)
+    weight = torch.randn(128, 64)
+    fallback = MagicMock(
+        side_effect=lambda _, x, weight, bias: torch.nn.functional.linear(
+            x, weight, bias
+        )
+    )
+    monkeypatch.setattr(utils, "default_unquantized_gemm", fallback)
+
+    out = utils.rocm_unquantized_gemm(torch.nn.Module(), x, weight)
+
+    fallback.assert_called_once()
+    torch.testing.assert_close(out, torch.nn.functional.linear(x, weight))
+
+
 def test_rocm_unquantized_gemm_gfx1x_wvsplitk_path(monkeypatch):
     x = torch.randn(1, 64, dtype=torch.float16)
     weight = torch.randn(128, 64, dtype=torch.float16)

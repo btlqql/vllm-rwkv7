@@ -40,6 +40,9 @@ ENGINE_MEMORY_PATTERN = re.compile(
     r"memory\..*?Current kv cache memory in use is ([0-9.]+) GiB"
 )
 NOISY_BNB_MESSAGES = ("MatMul8bitLt: inputs will be cast",)
+EXCEPTION_SUMMARY_PATTERN = re.compile(
+    r"(?:AssertionError|ImportError|ModuleNotFoundError|RuntimeError|ValueError): .+"
+)
 SETTINGS = (
     "fp16",
     "online-int8",
@@ -119,6 +122,16 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--rwkv7-backend",
+        choices=("auto", "torch", "triton"),
+        default="torch",
+        help=(
+            "RWKV7 recurrent backend used by every quantization setting. "
+            "Torch remains the default so weight-format comparisons preserve "
+            "the established baseline."
+        ),
+    )
+    parser.add_argument(
         "--jsonl-out",
         type=Path,
         help="Append one machine-readable benchmark record to this JSONL file.",
@@ -168,11 +181,11 @@ def run_worker(args: argparse.Namespace) -> None:
     assert args.worker_setting is not None
     assert args.worker_model is not None
 
-    # Quantization benchmarks measure weight formats, not the experimental
-    # recurrent kernel. Keep the recurrent path deterministic and fail-closed.
+    # Keep one recurrent backend across all settings so comparisons isolate
+    # the selected weight format. Torch remains the fail-closed default.
     import os
 
-    os.environ["VLLM_RWKV7_KERNEL"] = "torch"
+    os.environ["VLLM_RWKV7_KERNEL"] = args.rwkv7_backend
     if args.require_repeatable:
         os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
     # Keep the benchmark self-contained on CUDA hosts without a full nvcc
@@ -383,12 +396,14 @@ def run_worker(args: argparse.Namespace) -> None:
         "software": {
             "torch": torch.__version__,
             "cuda": torch.version.cuda,
+            "hip": getattr(torch.version, "hip", None),
             "vllm": vllm.__version__,
         },
         "request_metrics": request_metrics,
         "generated_token_logprobs": generated_token_logprobs,
         "repeatable": repeat_mismatch is None,
         "repeat_mismatch": repeat_mismatch,
+        "rwkv7_backend": args.rwkv7_backend,
         "online_int8_target_regex": args.online_int8_target_regex,
         "requests": [list(item.outputs[0].token_ids) for item in outputs],
     }
@@ -407,6 +422,20 @@ def _setting_model(args: argparse.Namespace, setting: str) -> tuple[str, bool]:
     if args.int4_model is None:
         return args.model, True
     return args.int4_model, False
+
+
+def select_unsupported_reason(exception_summaries: list[str]) -> str:
+    unique_summaries = list(dict.fromkeys(exception_summaries))
+    specific_summaries = [
+        summary
+        for summary in unique_summaries
+        if "Engine core initialization failed" not in summary
+    ]
+    if specific_summaries:
+        return specific_summaries[0]
+    if unique_summaries:
+        return unique_summaries[0]
+    return "worker exited without an exception summary"
 
 
 def run_setting(args: argparse.Namespace, setting: str) -> dict[str, Any]:
@@ -442,6 +471,7 @@ def run_setting(args: argparse.Namespace, setting: str) -> dict[str, Any]:
         command.extend(["--prompts-file", str(args.prompts_file)])
     if args.online_int8_target_regex is not None:
         command.extend(["--online-int8-target-regex", args.online_int8_target_regex])
+    command.extend(["--rwkv7-backend", args.rwkv7_backend])
     command.append("--enforce-eager" if args.enforce_eager else "--no-enforce-eager")
     command.append(
         "--async-scheduling" if args.async_scheduling else "--no-async-scheduling"
@@ -457,6 +487,7 @@ def run_setting(args: argparse.Namespace, setting: str) -> dict[str, Any]:
     model_memory_gib = None
     engine_memory = None
     output_tail: list[str] = []
+    exception_summaries: list[str] = []
     process = subprocess.Popen(
         command,
         stdout=subprocess.PIPE,
@@ -468,6 +499,8 @@ def run_setting(args: argparse.Namespace, setting: str) -> dict[str, Any]:
     for line in process.stdout:
         output_tail.append(line.rstrip())
         output_tail = output_tail[-20:]
+        if match := EXCEPTION_SUMMARY_PATTERN.search(line):
+            exception_summaries.append(match.group(0).strip())
         if match := MODEL_MEMORY_PATTERN.search(line):
             model_memory_gib = float(match.group(1))
         if match := ENGINE_MEMORY_PATTERN.search(line):
@@ -490,6 +523,7 @@ def run_setting(args: argparse.Namespace, setting: str) -> dict[str, Any]:
                 "setting": setting,
                 "model": model,
                 "supported": False,
+                "unsupported_reason": select_unsupported_reason(exception_summaries),
                 "error": "\n".join(output_tail),
             }
         raise RuntimeError(f"{setting} worker exited with status {return_code}")
@@ -596,6 +630,7 @@ def compact_result(result: dict[str, Any]) -> dict[str, Any]:
         "samples_s",
         "repeatable",
         "repeat_mismatch",
+        "rwkv7_backend",
         "online_int8_target_regex",
         "engine_memory",
     )
@@ -666,6 +701,10 @@ def main() -> None:
                 "warmup_runs": args.warmup_runs,
                 "repeats": args.repeats,
                 "prompt_count": len(load_prompts(args)),
+                "enforce_eager": args.enforce_eager,
+                "async_scheduling": args.async_scheduling,
+                "enable_chunked_prefill": True,
+                "rwkv7_backend": args.rwkv7_backend,
                 "online_int8_target_regex": args.online_int8_target_regex,
             },
             "results": {
