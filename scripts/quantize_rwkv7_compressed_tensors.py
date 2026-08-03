@@ -5,12 +5,12 @@
 
 import argparse
 import json
-import re
 import shutil
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
+import regex as re
 import torch
 from compressed_tensors.compressors.pack_quantized import (
     PackedQuantizationCompressor,
